@@ -5,7 +5,20 @@ Claude Design project *Mobile Shooter* (ECHELON / ShooterShell — Modernist gro
 dark theme). Five screens from the design are live: cold boot, lobby, loadout,
 gunsmith, and the in-game HUD.
 
-## Run
+## Play it
+
+**Live (phone-ready): https://warm-sun-523.higgsfield.gg/** — open in Chrome or
+Samsung Internet on Android, landscape. PLAY goes fullscreen and locks
+landscape orientation.
+
+Deployment record (for updating the same URL — pass this `game_id` back to
+`deploy_game`, never omit it on an update):
+
+- game_id: `db86761f-63d2-4125-9d4e-477c80f64227`
+- slug: `warm-sun-523`
+- bundle: `index.html` + `logic.js` (inert rules stub; game is client-side) + `js/**`
+
+## Run locally
 
 ```bash
 python -m http.server 8123
@@ -33,7 +46,25 @@ Then open http://localhost:8123 (ES modules + Three.js CDN require a server —
 - **Vault/parkour**: VAULT mantles onto ledges up to ~1.9 m in front of you,
   otherwise jumps.
 - **Match end** scoreboard with per-operator K/D, REDEPLOY / LOBBY.
-- Procedural WebAudio sound (gunfire, hits, kills, reload, damage).
+- **Staged reload animation**: tilt → mag drops → grab pause → fresh mag seats →
+  charging-handle rack, scaled to the loadout's real reload time, with
+  phase-timed sounds and a HUD progress bar.
+- Procedural WebAudio sound (gunfire, hits, kills, reload phases, damage).
+
+## Android optimizations
+
+- Three.js vendored locally (no CDN fetch), capped pixel ratio, MSAA skipped at
+  high DPR, `high-performance` WebGL context.
+- Adaptive resolution: pixel ratio steps down under sustained load and recovers
+  using the display's measured vsync floor (works on 60/120 Hz).
+- Shared unit-box geometry + material cache; HUD DOM writes only on change;
+  minimap throttled to 12 Hz.
+- Fullscreen + landscape orientation lock from the PLAY gesture; RESUME
+  re-enters it; auto-pause on fullscreen loss, portrait rotation, tab
+  switch/screen lock.
+- Android back gesture pauses the match (history sentinel) instead of
+  unloading the page; FIRE handles `touchcancel` so system gestures can't
+  stick the weapon in full-auto.
 
 ## Controls
 
