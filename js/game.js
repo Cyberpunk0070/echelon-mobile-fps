@@ -720,8 +720,9 @@ export class Game {
   /* ---------- input ---------- */
   setupInput() {
     this.keys = {};
-    this.stick = { active: false, id: -1, ox: 0, oy: 0, x: 0, y: 0 };
+    this.stick = { id: -1, ox: 0, oy: 0, x: 0, y: 0, mag: 0 };
     this.look = { id: -1, lx: 0, ly: 0 };
+    this.fireLookId = -1;
     this.firing = false;
     this.pointerLocked = false;
     this.ads = 0;          // 0 = hip, 1 = fully aimed
@@ -746,116 +747,108 @@ export class Game {
     // would otherwise stay latched and leave the player running or firing
     this.bind(window, "blur", () => this.resetInput());
 
-    // desktop: pointer lock look + click fire
-    this.bind(this.canvas, "mousedown", e => {
-      if (this.paused || this.over || !this.player.alive) return;
-      if (!this.pointerLocked) { this.canvas.requestPointerLock?.(); return; }
-      if (e.button === 0) this.firing = true;
-      if (e.button === 2) this.adsOn = true;   // desktop: hold right mouse to ADS
-    });
-    this.bind(window, "mouseup", e => {
-      if (e.button === 2) this.adsOn = false;
-      this.firing = this.fireBtnHeld || false;
-    });
+    /* ---- Pointer Events, one independent stream per finger ----
+       `click` is single-pointer and the browser suppresses it entirely once
+       preventDefault() runs on another active touch, which is why only one
+       control could be used at a time. Every control below reacts to
+       pointerdown and tracks its own pointerId, so move + look + fire +
+       reload + crouch all work simultaneously — the standard mobile-shooter
+       input model. */
     this.bind(this.canvas, "contextmenu", e => e.preventDefault());
     this.bind(document, "pointerlockchange", () => {
       this.pointerLocked = document.pointerLockElement === this.canvas;
     });
-    this.bind(window, "mousemove", e => {
-      if (!this.pointerLocked || this.paused) return;
-      this.player.yaw -= e.movementX * 0.0023 * this.lookScale;
-      this.player.pitch -= e.movementY * 0.0023 * this.lookScale;
-      this.clampPitch();
+
+    // FIRE: momentary, and the same finger also aims (drag off the button)
+    this.bindHold("btn-fire", {
+      down: e => {
+        this.sfx.ensure();
+        this.firing = true;
+        this.setSprint(false);            // shooting always beats sprinting
+        if (e.pointerType !== "mouse" && this.look.id === -1) {
+          this.look.id = e.pointerId;
+          this.look.lx = e.clientX;
+          this.look.ly = e.clientY;
+          this.fireLookId = e.pointerId;
+        }
+      },
+      up: () => {
+        this.firing = false;
+        if (this.fireLookId !== -1 && this.look.id === this.fireLookId) this.look.id = -1;
+        this.fireLookId = -1;
+      },
+    });
+    // ADS is momentary too: hold to aim, release to hip-fire, like console/PC
+    this.bindHold("btn-ads", { down: () => { this.adsOn = true; this.setSprint(false); },
+                               up: () => { this.adsOn = false; } });
+    this.bindPress("btn-reload", () => this.startReload());
+    this.bindPress("btn-vault", () => this.doVault());
+    this.bindPress("btn-crouch", () => this.toggleCrouch());
+
+    // stage: free pointers drive the move stick (left) and the look camera
+    const stage = this.$("stage");
+    this.bind(stage, "pointerdown", e => {
+      if (e.target?.closest?.("button")) return;   // buttons own their pointers
+      if (this.paused || this.over) return;
+      e.preventDefault();
+      if (e.pointerType === "mouse") {
+        if (!this.pointerLocked) { this.canvas.requestPointerLock?.(); return; }
+        if (e.button === 0) this.firing = true;
+        if (e.button === 2) this.adsOn = true;
+        return;
+      }
+      if (e.clientX < window.innerWidth * 0.42 && this.stick.id === -1) {
+        this.stick.id = e.pointerId;
+        this.stick.ox = e.clientX; this.stick.oy = e.clientY;
+        this.stick.x = 0; this.stick.y = 0; this.stick.mag = 0;
+      } else if (this.look.id === -1 || this.look.id === this.fireLookId) {
+        // a deliberate drag takes the camera over from the fire button's
+        // finger, so aiming works whether you drag off FIRE or use a second
+        // finger while holding it
+        this.fireLookId = -1;
+        this.look.id = e.pointerId;
+        this.look.lx = e.clientX; this.look.ly = e.clientY;
+      }
     });
 
-    // touch: left = move stick, right = look. The HUD layer is
-    // pointer-events:none, so free touches land on the stage; touches that
-    // start on HUD buttons are skipped here and handled by the buttons.
-    const surface = this.$("stage");
-    this.bind(surface, "touchstart", e => {
-      this.reconcileTouches(e);
-      if (this.paused || this.over) return;
-      for (const t of e.changedTouches) {
-        if (t.target?.closest?.("button")) continue;
-        const x = t.clientX, y = t.clientY;
-        if (x < window.innerWidth * 0.42 && this.stick.id === -1) {
-          this.stick.id = t.identifier;
-          this.stick.ox = x; this.stick.oy = y;
-          this.stick.x = 0; this.stick.y = 0;
-        } else if (x >= window.innerWidth * 0.42 && this.look.id === -1) {
-          this.look.id = t.identifier;
-          this.look.lx = x; this.look.ly = y;
-        }
-        e.preventDefault();
+    this.bind(stage, "pointermove", e => {
+      if (e.pointerType === "mouse") {
+        if (!this.pointerLocked || this.paused) return;
+        this.player.yaw -= e.movementX * 0.0023 * this.lookScale;
+        this.player.pitch -= e.movementY * 0.0023 * this.lookScale;
+        this.clampPitch();
+        return;
       }
-    }, { passive: false });
-    this.bind(surface, "touchmove", e => {
-      for (const t of e.changedTouches) {
-        if (t.identifier === this.stick.id) {
-          const dx = t.clientX - this.stick.ox, dy = t.clientY - this.stick.oy;
-          const m = Math.hypot(dx, dy), cap = 52;
-          const k = m > cap ? cap / m : 1;
-          this.stick.x = (dx * k) / cap;
-          this.stick.y = (dy * k) / cap;
-        } else if (t.identifier === this.look.id) {
-          this.player.yaw -= (t.clientX - this.look.lx) * 0.0052 * this.lookScale;
-          this.player.pitch -= (t.clientY - this.look.ly) * 0.0052 * this.lookScale;
-          this.clampPitch();
-          this.look.lx = t.clientX; this.look.ly = t.clientY;
-        }
+      if (e.pointerId === this.stick.id) {
+        const dx = e.clientX - this.stick.ox, dy = e.clientY - this.stick.oy;
+        const m = Math.hypot(dx, dy), cap = 52;
+        const k = m > cap ? cap / m : 1;
+        this.stick.x = (dx * k) / cap;
+        this.stick.y = (dy * k) / cap;
+        this.stick.mag = m / cap;         // uncapped: >1 means pushed past the ring
+      } else if (e.pointerId === this.look.id) {
+        this.player.yaw -= (e.clientX - this.look.lx) * 0.0052 * this.lookScale;
+        this.player.pitch -= (e.clientY - this.look.ly) * 0.0052 * this.lookScale;
+        this.clampPitch();
+        this.look.lx = e.clientX; this.look.ly = e.clientY;
       }
-      e.preventDefault();
-    }, { passive: false });
-    const touchEnd = e => {
-      for (const t of e.changedTouches) {
-        if (t.identifier === this.stick.id) { this.stick.id = -1; this.stick.x = 0; this.stick.y = 0; }
-        if (t.identifier === this.look.id) this.look.id = -1;
-        if (t.identifier === this.fireTouchId) { this.fireTouchId = -1; this.fireBtnHeld = false; this.firing = false; }
-      }
-      this.reconcileTouches(e);
-    };
-    this.bind(surface, "touchend", touchEnd);
-    this.bind(surface, "touchcancel", touchEnd);
+    });
 
-    // buttons — a touch that starts on FIRE also drives the look camera
-    // (CoD-style: track targets while holding fire)
-    const fireBtn = this.$("btn-fire");
-    const fstart = e => {
-      e.preventDefault();
-      this.sfx.ensure();
-      this.fireBtnHeld = true;
-      this.firing = true;
-      this.setSprint(false);           // shooting always wins over sprinting
-      if (e.changedTouches?.length && this.look.id === -1) {
-        const t = e.changedTouches[0];
-        this.fireTouchId = t.identifier;
-        this.look.id = t.identifier;   // same finger aims while it fires
-        this.look.lx = t.clientX;
-        this.look.ly = t.clientY;
+    const release = e => {
+      if (e.pointerType === "mouse") {
+        if (e.button === 2) this.adsOn = false;
+        this.firing = false;
+        return;
       }
-    };
-    const fend = e => {
-      e.preventDefault();
-      this.fireBtnHeld = false;
-      if (!this.pointerLocked) this.firing = false;
-      // release the look claim so the finger can't leave the camera latched
-      if (this.fireTouchId !== -1) {
-        if (this.look.id === this.fireTouchId) this.look.id = -1;
-        this.fireTouchId = -1;
+      if (e.pointerId === this.stick.id) {
+        this.stick.id = -1; this.stick.x = 0; this.stick.y = 0; this.stick.mag = 0;
+        this.setSprint(false);
       }
+      if (e.pointerId === this.look.id) this.look.id = -1;
     };
-    this.bind(fireBtn, "touchstart", fstart, { passive: false });
-    this.bind(fireBtn, "touchend", fend, { passive: false });
-    // Android turns a held touch into a system gesture via touchcancel —
-    // without this the weapon sticks in full-auto
-    this.bind(fireBtn, "touchcancel", fend, { passive: false });
-    this.bind(fireBtn, "mousedown", fstart);
-    this.bind(fireBtn, "mouseup", fend);
-    this.bind(this.$("btn-reload"), "click", () => this.startReload());
-    this.bind(this.$("btn-vault"), "click", () => this.doVault());
-    this.bind(this.$("btn-ads"), "click", () => this.toggleAds());
-    this.bind(this.$("btn-sprint"), "click", () => this.setSprint(!this.sprinting));
-    this.bind(this.$("btn-crouch"), "click", () => this.toggleCrouch());
+    this.bind(stage, "pointerup", release);
+    this.bind(stage, "pointercancel", release);
+    this.bind(window, "pointerup", release);
 
     // mobile: tabbing away / locking the screen pauses the match
     this.bind(document, "visibilitychange", () => {
@@ -863,6 +856,45 @@ export class Game {
         this.setPaused(true);
         this.$("overlay-pause").classList.add("active");
       }
+    });
+  }
+
+  /* A momentary control: fires `down` on press and `up` on release, tracking
+     exactly one pointerId. Pointer capture keeps the release bound to this
+     element even if the finger slides off, so the control can never latch. */
+  bindHold(id, { down, up }) {
+    const el = this.$(id);
+    let held = -1;
+    this.bind(el, "pointerdown", e => {
+      if (held !== -1 || this.paused || this.over) return;
+      e.preventDefault();
+      e.stopPropagation();
+      held = e.pointerId;
+      try { el.setPointerCapture(e.pointerId); } catch { /* already gone */ }
+      el.classList.add("held");
+      down?.(e);
+    });
+    const end = e => {
+      if (e.pointerId !== held) return;
+      held = -1;
+      el.classList.remove("held");
+      up?.(e);
+    };
+    this.bind(el, "pointerup", end);
+    this.bind(el, "pointercancel", end);
+    this.bind(el, "lostpointercapture", end);
+  }
+
+  // A one-shot control: acts immediately on press, no release semantics.
+  bindPress(id, fn) {
+    const el = this.$(id);
+    this.bind(el, "pointerdown", e => {
+      if (this.paused || this.over) return;
+      e.preventDefault();
+      e.stopPropagation();
+      el.classList.add("held");
+      setTimeout(() => el.classList.remove("held"), 110);
+      fn(e);
     });
   }
 
@@ -1054,38 +1086,17 @@ export class Game {
     this.crouching = false;
   }
 
-  // Every tracked touch id is re-checked against the live touch list on every
-  // touch event. Android can drop a touchend (system gesture, palm rejection,
-  // identifier reuse), which used to leave the stick latched — the player then
-  // ran into a wall forever and could not act.
-  reconcileTouches(e) {
-    const live = new Set();
-    for (const t of e.touches) live.add(t.identifier);
-    if (this.stick.id !== -1 && !live.has(this.stick.id)) {
-      this.stick.id = -1; this.stick.x = 0; this.stick.y = 0;
-    }
-    if (this.look.id !== -1 && !live.has(this.look.id)) this.look.id = -1;
-    if (this.fireTouchId !== -1 && !live.has(this.fireTouchId)) {
-      this.fireTouchId = -1; this.fireBtnHeld = false; this.firing = false;
-    }
-    if (live.size === 0) {
-      // nothing is touching the screen: no input may remain held
-      this.stick.id = -1; this.stick.x = 0; this.stick.y = 0;
-      this.look.id = -1;
-      this.fireTouchId = -1;
-      this.fireBtnHeld = false;
-      if (!this.pointerLocked) this.firing = false;
-    }
-  }
-
   resetInput() {
     this.keys = {};
-    this.stick.id = -1; this.stick.x = 0; this.stick.y = 0;
+    this.stick.id = -1; this.stick.x = 0; this.stick.y = 0; this.stick.mag = 0;
     this.look.id = -1;
-    this.fireTouchId = -1;
-    this.fireBtnHeld = false;
+    this.fireLookId = -1;
     this.firing = false;
+    this.adsOn = false;
     this.sprinting = false;
+    for (const id of ["btn-fire", "btn-ads", "btn-reload", "btn-vault", "btn-crouch"]) {
+      this.$(id).classList.remove("held");
+    }
   }
 
   // Push the player out of any box they are overlapping. Without this, ending
@@ -1263,9 +1274,22 @@ export class Game {
         mx += this.stick.x; mz += this.stick.y;
         const mlen = Math.hypot(mx, mz);
         if (mlen > 1) { mx /= mlen; mz /= mlen; }
-        // sprint only holds while genuinely moving forward
-        if (this.sprinting && (mlen < 0.35 || mz > 0.4)) this.setSprint(false);
-        if (this.keys["ShiftLeft"] && mlen > 0.35 && !this.crouching) this.setSprint(true);
+        // Sprint is a stick gesture: shove the stick to the outer ring while
+        // heading forward. Hysteresis (0.95 in / 0.8 out) stops it flickering
+        // right at the boundary.
+        // Combat always outranks sprinting: while firing, aiming or reloading
+        // the stick may sit at the ring without dragging the player back into
+        // a sprint (which would cancel ADS and block the trigger every frame).
+        const busy = this.firing || this.adsOn || p.reloading > 0 || this.crouching;
+        const pushedToRing = (this.stick.mag ?? 0) >= 0.95 && this.stick.y < -0.35;
+        const backOff = (this.stick.mag ?? 0) < 0.8 || this.stick.y > -0.15;
+        if (busy) this.setSprint(false);
+        else if (this.stick.id !== -1) {
+          if (pushedToRing) this.setSprint(true);
+          else if (backOff) this.setSprint(false);
+        }
+        if (this.sprinting && mlen < 0.35) this.setSprint(false);
+        if (this.keys["ShiftLeft"] && mlen > 0.35 && !busy) this.setSprint(true);
 
         const sin = Math.sin(p.yaw), cos = Math.cos(p.yaw);
         const wx = (-sin * -mz) + (cos * mx);
@@ -1435,8 +1459,6 @@ export class Game {
     });
     this.hudSet("scope", L.scope && this.ads > 0.92,
       v => { this.$("scope-overlay").style.display = v ? "block" : "none"; });
-    this.hudSet("adsBtn", this.adsOn,
-      v => this.$("btn-ads").classList.toggle("on", v));
     // vignette is derived from state every frame, never from a timer that a
     // respawn or a forced heal could outlive
     const hurtAge = this.timeSinceHurt();
@@ -1445,10 +1467,12 @@ export class Game {
       : p.hp < 35 ? 0.4
       : 0;
     this.hudSet("vig", vig.toFixed(2), v => { this.$("dmg-vignette").style.opacity = v; });
-    this.hudSet("sprintBtn", this.sprinting,
-      v => this.$("btn-sprint").classList.toggle("on", v));
+    this.hudSet("sprintRing", this.sprinting,
+      v => this.$("joy-zone").classList.toggle("sprint", v));
     this.hudSet("crouchBtn", this.crouching,
       v => this.$("btn-crouch").classList.toggle("on", v));
+    this.hudSet("adsBtnHeld", this.adsOn,
+      v => this.$("btn-ads").classList.toggle("on", v));
 
     // compass: strip spans are 55px per 45°
     const yawDeg = ((-this.player.yaw * 180 / Math.PI) % 360 + 360) % 360;
@@ -1490,8 +1514,7 @@ export class Game {
   setPaused(v) {
     this.paused = v;
     if (v) {
-      this.firing = false;
-      this.fireBtnHeld = false; // stale flag would re-assert firing on mouseup
+      this.resetInput();       // nothing may stay held across a pause
       document.exitPointerLock?.();
     } else {
       this.last = performance.now();
