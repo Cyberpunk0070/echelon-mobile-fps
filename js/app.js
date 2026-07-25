@@ -311,6 +311,9 @@ function startMatch() {
   showScreen("hud");
   $("overlay-end").classList.remove("active");
   $("overlay-pause").classList.remove("active");
+  // sentinel history entry: Android's back gesture pops this (and pauses via
+  // the popstate listener) instead of unloading the page mid-match
+  if (history.state?.inMatch !== 1) history.pushState({ inMatch: 1 }, "");
   state.game = new Game({
     canvas: $("gl"),
     loadout,
@@ -348,6 +351,7 @@ function initOverlays() {
   });
   $("btn-resume").addEventListener("click", () => {
     $("overlay-pause").classList.remove("active");
+    goImmersive(); // valid user gesture: restore fullscreen + landscape lock
     state.game?.setPaused(false);
   });
   $("btn-abandon").addEventListener("click", () => {
@@ -372,6 +376,31 @@ function initOverlays() {
       if (pauseOpen) { $("overlay-pause").classList.remove("active"); state.game.setPaused(false); }
       else { state.game.setPaused(true); $("overlay-pause").classList.add("active"); }
     }
+  });
+
+  const pauseMatch = () => {
+    if (state.game && !state.game.over && !state.game.paused) {
+      state.game.setPaused(true);
+      $("overlay-pause").classList.add("active");
+    }
+  };
+  // Android back gesture: swallow the pop, re-arm the sentinel, pause
+  window.addEventListener("popstate", () => {
+    if (state.game && !state.game.over) {
+      history.pushState({ inMatch: 1 }, "");
+      pauseMatch();
+    }
+  });
+  window.addEventListener("beforeunload", e => {
+    if (state.game && !state.game.over) { e.preventDefault(); e.returnValue = ""; }
+  });
+  // losing fullscreen (back swipe, shade pull) or rotating to portrait
+  // releases the orientation lock — pause instead of playing blind
+  document.addEventListener("fullscreenchange", () => {
+    if (!document.fullscreenElement) pauseMatch();
+  });
+  matchMedia("(orientation: portrait)").addEventListener("change", e => {
+    if (e.matches) pauseMatch();
   });
 }
 

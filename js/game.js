@@ -101,12 +101,16 @@ export class Game {
         // adaptive resolution: if the phone can't hold frame time, step the
         // pixel ratio down (and back up when there's headroom)
         this.perfAccum += rawDt; this.perfFrames++;
+        if (rawDt < this.perfMin) this.perfMin = rawDt;
         if (this.perfFrames >= 120) {
           const avg = this.perfAccum / this.perfFrames;
-          this.perfAccum = 0; this.perfFrames = 0;
+          // recovery threshold derives from the display's measured refresh
+          // period — a fixed constant would be unreachable on 60 Hz vsync
+          const floor = this.perfMin;
+          this.perfAccum = 0; this.perfFrames = 0; this.perfMin = Infinity;
           const scales = [1, 0.8, 0.65];
           if (avg > 0.020 && this.perfLevel < 2) this.perfLevel++;
-          else if (avg < 0.011 && this.perfLevel > 0) this.perfLevel--;
+          else if (avg < Math.max(0.011, floor * 1.15) && this.perfLevel > 0) this.perfLevel--;
           const target = this.basePixelRatio * scales[this.perfLevel];
           if (Math.abs(this.renderer.getPixelRatio() - target) > 0.01) {
             this.renderer.setPixelRatio(target);
@@ -130,6 +134,7 @@ export class Game {
     });
     this.renderer.setPixelRatio(this.basePixelRatio);
     this.perfLevel = 0; this.perfAccum = 0; this.perfFrames = 0;
+    this.perfMin = Infinity; // per-window vsync floor estimate
     this.geoCache = new THREE.BoxGeometry(1, 1, 1);
     this.matCache = new Map();
     this.scene = new THREE.Scene();
@@ -560,6 +565,9 @@ export class Game {
     const fend = e => { e.preventDefault(); this.fireBtnHeld = false; if (!this.pointerLocked) this.firing = false; };
     this.bind(fireBtn, "touchstart", fstart, { passive: false });
     this.bind(fireBtn, "touchend", fend, { passive: false });
+    // Android turns a held touch into a system gesture via touchcancel —
+    // without this the weapon sticks in full-auto
+    this.bind(fireBtn, "touchcancel", fend, { passive: false });
     this.bind(fireBtn, "mousedown", fstart);
     this.bind(fireBtn, "mouseup", fend);
     this.bind(this.$("btn-reload"), "click", () => this.startReload());
@@ -601,6 +609,10 @@ export class Game {
       }
     }
     this.$("killfeed").innerHTML = "";
+    // the HUD DOM is shared across Game instances — clear anything a
+    // mid-reload match end could have left stranded
+    this.$("reload-ring").style.display = "none";
+    this.$("reload-fill").style.width = "0%";
     this.setPrompt("HOLD LEFT EDGE TO SLIDE");
     this.moveLabel = "SPRINT";
     this.hudCache = {};      // avoid touching the DOM when values are unchanged
@@ -667,6 +679,7 @@ export class Game {
     p.deaths++;
     p.respawnT = 3.2;
     p.reloading = 0;
+    p.vaultT = 0; p.vaultFrom = null; p.vaultTo = null; // no ghost-vault after respawn
     this.$("reload-ring").style.display = "none";
     this.firing = false;
     this.score[1]++;
@@ -710,6 +723,7 @@ export class Game {
   /* ---------- player actions ---------- */
   startReload() {
     const p = this.player, L = this.loadout;
+    if (this.paused || this.over) return; // update() no longer runs — a reload would strand
     if (!p.alive || p.reloading > 0 || p.ammo >= L.mag || p.reserve <= 0) return;
     p.reloading = L.reloadTime;
     this._rlPhase = -1;
@@ -734,13 +748,20 @@ export class Game {
     }
     this.sfx.vault();
     if (ledge) {
-      p.vaultT = 0.36;
-      p.vaultFrom = p.pos.clone();
-      p.vaultTo = new THREE.Vector3(
+      const to = new THREE.Vector3(
         Math.max(ledge.minX + 0.5, Math.min(ledge.maxX - 0.5, px)),
         ledge.top,
         Math.max(ledge.minZ + 0.5, Math.min(ledge.maxZ - 0.5, pz))
       );
+      // landing spot must have standing room — a stacked container or the
+      // perimeter wall above the ledge would entomb the player
+      if (this.collides(to.x, to.z, p.radius, to.y, to.y + p.height)) {
+        if (p.grounded) { p.vy = 5.6; p.grounded = false; this.moveLabel = "AIRBORNE"; }
+        return;
+      }
+      p.vaultT = 0.36;
+      p.vaultFrom = p.pos.clone();
+      p.vaultTo = to;
       this.moveLabel = "VAULT · MANTLE";
       this.setPrompt("PARKOUR CHAIN ×2 · +4 TEMPO");
     } else if (p.grounded) {
@@ -1009,8 +1030,13 @@ export class Game {
   /* ---------- lifecycle ---------- */
   setPaused(v) {
     this.paused = v;
-    if (v) { this.firing = false; document.exitPointerLock?.(); }
-    else this.last = performance.now();
+    if (v) {
+      this.firing = false;
+      this.fireBtnHeld = false; // stale flag would re-assert firing on mouseup
+      document.exitPointerLock?.();
+    } else {
+      this.last = performance.now();
+    }
   }
 
   dispose() {
@@ -1022,8 +1048,14 @@ export class Game {
     document.exitPointerLock?.();
     this.scene.traverse(o => {
       if (o.geometry) o.geometry.dispose();
-      if (o.material) (Array.isArray(o.material) ? o.material : [o.material]).forEach(m => m.dispose());
+      if (o.material) (Array.isArray(o.material) ? o.material : [o.material]).forEach(m => {
+        if (m.map) m.map.dispose();
+        m.dispose();
+      });
     });
+    this.tracerMat.dispose();
     this.renderer.dispose();
+    this.sfx.ctx?.close?.();
+    if (window.__game === this) window.__game = null;
   }
 }
