@@ -778,9 +778,9 @@ export class Game {
         this.fireLookId = -1;
       },
     });
-    // ADS is momentary too: hold to aim, release to hip-fire, like console/PC
-    this.bindHold("btn-ads", { down: () => { this.adsOn = true; this.setSprint(false); },
-                               up: () => { this.adsOn = false; } });
+    // ADS toggles: tap to enter the sights, tap again to drop back to hip.
+    // A hold would occupy a thumb you need for the trigger.
+    this.bindPress("btn-ads", () => this.toggleAds());
     this.bindPress("btn-reload", () => this.startReload());
     this.bindPress("btn-vault", () => this.doVault());
     this.bindPress("btn-crouch", () => this.toggleCrouch());

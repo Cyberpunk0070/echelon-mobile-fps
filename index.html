@@ -260,7 +260,10 @@ body.in-match #status-strip{display:none}
 #muzzle{position:absolute;right:calc(var(--edge-r) + 44px);bottom:calc(var(--edge-b) + var(--fire) - 4px);width:30px;height:30px;background:var(--red);opacity:0}
 #muzzle.show{animation:muzzle .16s linear}
 #crosshair{transition:transform .12s linear,opacity .12s linear}
-#scope-overlay{position:absolute;inset:0;display:none;pointer-events:none;z-index:25}
+/* the scope sits BEHIND the controls: FIRE/RELOAD must stay crisp and
+   tappable while you are aiming down the glass */
+#scope-overlay{position:absolute;inset:0;display:none;pointer-events:none;z-index:1}
+.hud-btn,#btn-fire,#ammo-block,#hud-left-stats,#joy-zone{z-index:3}
 #scope-overlay .mask{position:absolute;inset:0;background:radial-gradient(circle at 50% 50%,transparent 0 32vmin,rgba(10,9,8,.99) 33.5vmin)}
 #scope-overlay .h{position:absolute;left:0;right:0;top:50%;height:1px;background:rgba(243,242,242,.55)}
 #scope-overlay .v{position:absolute;top:0;bottom:0;left:50%;width:1px;background:rgba(243,242,242,.55)}

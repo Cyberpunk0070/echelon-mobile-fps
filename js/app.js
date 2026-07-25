@@ -184,9 +184,38 @@ function renderLoadout() {
 }
 
 /* ---------------- gunsmith ---------------- */
-const PINS = [
-  { x: 52, y: 22, label: "OPTIC" }, { x: 22, y: 62, label: "MUZZLE" },
-  { x: 62, y: 68, label: "GRIP" }, { x: 80, y: 34, label: "STOCK" },
+// Callouts live in the SVG's own coordinate space (viewBox 0 0 520 260) so
+// each label can be joined to the part it names by a real leader line:
+// l* = label anchor, t* = the point on the weapon it points at.
+const PIN_SETS = [
+  [ // KM-7 MERIDIAN
+    { label: "OPTIC", lx: 236, ly: 34, tx: 204, ty: 94 },
+    { label: "MUZZLE", lx: 452, ly: 74, tx: 406, ty: 126 },
+    { label: "UNDERBRL", lx: 356, ly: 226, tx: 312, ty: 164 },
+    { label: "STOCK", lx: 96, ly: 52, tx: 73, ty: 116 },
+    { label: "MAGAZINE", lx: 150, ly: 240, tx: 218, ty: 196 },
+  ],
+  [ // VZ-9 CINDER
+    { label: "OPTIC", lx: 208, ly: 44, tx: 189, ty: 104 },
+    { label: "MUZZLE", lx: 424, ly: 88, tx: 369, ty: 128 },
+    { label: "GRIP", lx: 96, ly: 232, tx: 163, ty: 196 },
+    { label: "STOCK", lx: 112, ly: 58, tx: 94, ty: 122 },
+    { label: "MAGAZINE", lx: 236, ly: 236, tx: 206, ty: 192 },
+  ],
+  [ // LR-13 OBELISK
+    { label: "OPTIC", lx: 262, ly: 36, tx: 231, ty: 96 },
+    { label: "MUZZLE", lx: 430, ly: 62, tx: 451, ty: 108 },
+    { label: "BIPOD", lx: 392, ly: 226, tx: 335, ty: 162 },
+    { label: "STOCK", lx: 92, ly: 52, tx: 63, ty: 112 },
+    { label: "MAGAZINE", lx: 168, ly: 240, tx: 227, ty: 196 },
+  ],
+  [ // AM-50 BASILISK
+    { label: "OPTIC", lx: 250, ly: 30, tx: 226, ty: 84 },
+    { label: "MUZZLE BRAKE", lx: 452, ly: 76, tx: 470, ty: 116 },
+    { label: "BIPOD", lx: 380, ly: 232, tx: 330, ty: 170 },
+    { label: "STOCK", lx: 88, ly: 50, tx: 58, ty: 112 },
+    { label: "MAGAZINE", lx: 150, ly: 240, tx: 214, ty: 200 },
+  ],
 ];
 
 function weaponSvg(idx) {
@@ -213,6 +242,18 @@ function weaponSvg(idx) {
     <rect x="196" y="96" width="70" height="20" fill="${dark}"/>
     <rect x="226" y="90" width="8" height="8" fill="${acc}"/>
     <rect x="300" y="132" width="70" height="30" fill="${dark}"/>`;
+  if (idx === 3) return `
+    <rect x="86" y="106" width="210" height="42" fill="${ink}"/>
+    <rect x="288" y="116" width="176" height="20" fill="${mid}"/>
+    <rect x="456" y="110" width="34" height="32" fill="${dark}"/>
+    <rect x="456" y="122" width="34" height="6" fill="${acc}"/>
+    <rect x="146" y="150" width="26" height="70" fill="${dark}" transform="skewX(-8)"/>
+    <rect x="200" y="150" width="26" height="54" fill="${ink}" transform="skewX(-4)"/>
+    <rect x="28" y="104" width="60" height="40" fill="${dark}"/>
+    <rect x="28" y="120" width="60" height="6" fill="${acc}"/>
+    <rect x="188" y="80" width="82" height="24" fill="${dark}"/>
+    <rect x="222" y="70" width="10" height="12" fill="${acc}"/>
+    <rect x="300" y="140" width="64" height="34" fill="${dark}"/>`;
   return `
     <rect x="100" y="112" width="180" height="38" fill="${ink}"/>
     <rect x="272" y="120" width="120" height="20" fill="${mid}"/>
@@ -224,6 +265,21 @@ function weaponSvg(idx) {
     <rect x="176" y="94" width="56" height="20" fill="${dark}"/>
     <rect x="198" y="86" width="8" height="10" fill="${acc}"/>
     <rect x="286" y="138" width="52" height="26" fill="${dark}"/>`;
+}
+
+// Leader line + marker + label for one callout, drawn in SVG space.
+function pinSvg(p) {
+  const right = p.lx > p.tx;
+  const anchor = right ? "start" : "end";
+  const stubX = p.lx + (right ? 10 : -10);
+  return `<g class="pin-g">
+    <polyline points="${p.tx},${p.ty} ${p.lx},${p.ly} ${stubX},${p.ly}"
+      fill="none" stroke="#ff563c" stroke-width="1.5" opacity=".85"/>
+    <rect x="${p.tx - 3.5}" y="${p.ty - 3.5}" width="7" height="7" fill="#ff563c"/>
+    <text x="${stubX + (right ? 4 : -4)}" y="${p.ly + 3.5}" text-anchor="${anchor}"
+      font-family="Archivo,sans-serif" font-size="11" font-weight="800"
+      letter-spacing="1.2" fill="#f3f2f2">${p.label}</text>
+  </g>`;
 }
 
 function renderGunsmith() {
@@ -248,8 +304,8 @@ function renderGunsmith() {
     <svg viewBox="0 0 520 260" preserveAspectRatio="xMidYMid meet">
       <line x1="0" y1="122" x2="520" y2="122" stroke="rgba(243,242,242,.16)" stroke-width="1"/>
       ${weaponSvg(state.weapon)}
-    </svg>` +
-    PINS.map(p => `<div class="pin" style="left:${p.x}%;top:${p.y}%"><div class="dot"></div><div class="plbl">${p.label}</div></div>`).join("");
+      ${(PIN_SETS[state.weapon] || PIN_SETS[0]).map(pinSvg).join("")}
+    </svg>`;
 
   // attachment slots
   const atts = $("gs-atts");
