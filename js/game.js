@@ -7,8 +7,123 @@ const DARK = { bg: 0x151312, surface: 0x211f1e, text: 0xf3f2f2, red: 0xff563c };
 const ARENA = 47;              // half-extent of playable area
 const GRAVITY = 16;
 const EYE = 1.55;
+const EYE_CROUCH = 1.02;
+const SPRINT_MULT = 1.5;
+const CROUCH_MULT = 0.52;
+const SPRINT_OUT = 0.18;   // seconds from dropping sprint to first shot
 
 const _a = new THREE.Vector3(), _b = new THREE.Vector3();
+
+/* ---------------- broadphase ----------------
+   Uniform spatial hash over the static world AABBs. Queries that used to scan
+   every box now touch only the cells they overlap, and rays walk the grid with
+   a 2D DDA (the standard voxel-traversal approach) instead of testing all of
+   them. Cell size is tuned to the container footprint. */
+const GRID_CELL = 6;
+
+class SpatialHash {
+  constructor(boxes, cell = GRID_CELL) {
+    this.cell = cell;
+    this.boxes = boxes;
+    this.map = new Map();
+    this.stamp = new Int32Array(boxes.length);
+    this.tick = 0;
+    for (let i = 0; i < boxes.length; i++) {
+      const b = boxes[i];
+      const x0 = Math.floor(b.minX / cell), x1 = Math.floor(b.maxX / cell);
+      const z0 = Math.floor(b.minZ / cell), z1 = Math.floor(b.maxZ / cell);
+      for (let x = x0; x <= x1; x++) {
+        for (let z = z0; z <= z1; z++) {
+          const k = x * 73856093 ^ z * 19349663;
+          let arr = this.map.get(k);
+          if (!arr) { arr = []; this.map.set(k, arr); }
+          arr.push(i);
+        }
+      }
+    }
+  }
+
+  cellAt(x, z) { return this.map.get(x * 73856093 ^ z * 19349663); }
+
+  // indices of boxes whose cells overlap the XZ rect, deduped via a stamp
+  query(minX, maxX, minZ, maxZ, out) {
+    out.length = 0;
+    const c = this.cell;
+    const t = ++this.tick;
+    const x0 = Math.floor(minX / c), x1 = Math.floor(maxX / c);
+    const z0 = Math.floor(minZ / c), z1 = Math.floor(maxZ / c);
+    for (let x = x0; x <= x1; x++) {
+      for (let z = z0; z <= z1; z++) {
+        const arr = this.cellAt(x, z);
+        if (!arr) continue;
+        for (let i = 0; i < arr.length; i++) {
+          const bi = arr[i];
+          if (this.stamp[bi] === t) continue;
+          this.stamp[bi] = t;
+          out.push(bi);
+        }
+      }
+    }
+    return out;
+  }
+}
+
+// Ray vs AABB, slab method. Returns entry distance or Infinity.
+function slabHit(b, ox, oy, oz, dx, dy, dz, maxDist) {
+  let tmin = 0, tmax = maxDist;
+  if (Math.abs(dx) < 1e-9) { if (ox < b.minX || ox > b.maxX) return Infinity; }
+  else {
+    let t1 = (b.minX - ox) / dx, t2 = (b.maxX - ox) / dx;
+    if (t1 > t2) { const s = t1; t1 = t2; t2 = s; }
+    if (t1 > tmin) tmin = t1;
+    if (t2 < tmax) tmax = t2;
+    if (tmin > tmax) return Infinity;
+  }
+  if (Math.abs(dy) < 1e-9) { if (oy < b.y0 || oy > b.top) return Infinity; }
+  else {
+    let t1 = (b.y0 - oy) / dy, t2 = (b.top - oy) / dy;
+    if (t1 > t2) { const s = t1; t1 = t2; t2 = s; }
+    if (t1 > tmin) tmin = t1;
+    if (t2 < tmax) tmax = t2;
+    if (tmin > tmax) return Infinity;
+  }
+  if (Math.abs(dz) < 1e-9) { if (oz < b.minZ || oz > b.maxZ) return Infinity; }
+  else {
+    let t1 = (b.minZ - oz) / dz, t2 = (b.maxZ - oz) / dz;
+    if (t1 > t2) { const s = t1; t1 = t2; t2 = s; }
+    if (t1 > tmin) tmin = t1;
+    if (t2 < tmax) tmax = t2;
+    if (tmin > tmax) return Infinity;
+  }
+  return tmin;
+}
+
+/* Segmented hitboxes in the bot's local frame (facing -z, origin at feet),
+   the standard FPS model: a head worth a one-shot multiplier, a torso, and
+   lower-value legs. Replaces the old single cylinder + height threshold. */
+const HITBOXES = [
+  { name: "HEAD", cx: 0, cy: 1.68, cz: 0, hx: 0.17, hy: 0.17, hz: 0.17, mult: 2.0 },
+  { name: "CHEST", cx: 0, cy: 1.22, cz: 0, hx: 0.33, hy: 0.30, hz: 0.22, mult: 1.0 },
+  { name: "ABDOMEN", cx: 0, cy: 0.80, cz: 0, hx: 0.30, hy: 0.22, hz: 0.20, mult: 0.9 },
+  { name: "LEGS", cx: 0, cy: 0.36, cz: 0, hx: 0.28, hy: 0.36, hz: 0.19, mult: 0.75 },
+];
+
+// Ray vs a local-space box (half extents), slab method.
+function localSlabHit(h, ox, oy, oz, dx, dy, dz, maxDist) {
+  let tmin = 0, tmax = maxDist;
+  const lo = [h.cx - h.hx, h.cy - h.hy, h.cz - h.hz];
+  const hi = [h.cx + h.hx, h.cy + h.hy, h.cz + h.hz];
+  const o = [ox, oy, oz], d = [dx, dy, dz];
+  for (let i = 0; i < 3; i++) {
+    if (Math.abs(d[i]) < 1e-9) { if (o[i] < lo[i] || o[i] > hi[i]) return Infinity; continue; }
+    let t1 = (lo[i] - o[i]) / d[i], t2 = (hi[i] - o[i]) / d[i];
+    if (t1 > t2) { const s = t1; t1 = t2; t2 = s; }
+    if (t1 > tmin) tmin = t1;
+    if (t2 < tmax) tmax = t2;
+    if (tmin > tmax) return Infinity;
+  }
+  return tmin;
+}
 
 /* ---------------- audio ---------------- */
 class Sfx {
@@ -91,6 +206,7 @@ export class Game {
     this.score = [0, 0];
     this.last = performance.now();
     this.fpsFrames = 0; this.fpsT = 0;
+    this.pushTimer = 20;
     window.__game = this; // debug/QA handle
     const loop = (now) => {
       if (this.disposed) return;
@@ -162,11 +278,20 @@ export class Game {
     this._onResize = () => this.resize();
     window.addEventListener("resize", this._onResize);
 
-    const hemi = new THREE.HemisphereLight(0xb5b0ac, 0x2a2725, 1.7);
+    // Three-point rig: a warm key defines form, a cool fill keeps shadowed
+    // faces readable (enemies used to vanish into them), and a low bounce
+    // separates geometry from the ground plane.
+    const hemi = new THREE.HemisphereLight(0xaebac6, 0x38302c, 1.25);
     this.scene.add(hemi);
-    const sun = new THREE.DirectionalLight(0xf3f2f2, 1.35);
-    sun.position.set(30, 60, -20);
-    this.scene.add(sun);
+    const key = new THREE.DirectionalLight(0xfff0e4, 1.55);
+    key.position.set(30, 60, -20);
+    this.scene.add(key);
+    const fill = new THREE.DirectionalLight(0x93b0cc, 0.62);
+    fill.position.set(-42, 26, 38);
+    this.scene.add(fill);
+    const bounce = new THREE.DirectionalLight(0xffd9c2, 0.24);
+    bounce.position.set(6, -20, 12);
+    this.scene.add(bounce);
   }
 
   resize() {
@@ -286,15 +411,19 @@ export class Game {
     this.addBox(0, 0, 3.5, 3.5, 6.5, DARK.red);
 
     this.buildStaticMeshes();
+    this.grid = new SpatialHash(this.boxes);
+    this._q = [];   // scratch list reused by every broadphase query
   }
 
   /* ---------- collision & rays ---------- */
   collides(x, z, r, feet, head) {
-    for (const b of this.boxes) {
+    if (Math.abs(x) > ARENA || Math.abs(z) > ARENA) return true;
+    const hits = this.grid.query(x - r, x + r, z - r, z + r, this._q);
+    for (let i = 0; i < hits.length; i++) {
+      const b = this.boxes[hits[i]];
       if (b.top <= feet + 0.55 || b.y0 >= head) continue; // can step on / walk under
       if (x + r > b.minX && x - r < b.maxX && z + r > b.minZ && z - r < b.maxZ) return true;
     }
-    if (Math.abs(x) > ARENA || Math.abs(z) > ARENA) return true;
     return false;
   }
 
@@ -307,7 +436,9 @@ export class Game {
 
   groundHeight(x, z, r, feet) {
     let g = 0;
-    for (const b of this.boxes) {
+    const hits = this.grid.query(x - r, x + r, z - r, z + r, this._q);
+    for (let i = 0; i < hits.length; i++) {
+      const b = this.boxes[hits[i]];
       if (x + r > b.minX && x - r < b.maxX && z + r > b.minZ && z - r < b.maxZ) {
         if (b.top <= feet + 0.55 && b.top > g) g = b.top;
       }
@@ -315,43 +446,72 @@ export class Game {
     return g;
   }
 
-  // ray vs AABBs — returns nearest hit t along dir (len = maxDist), or Infinity
+  // Nearest world hit along the ray, via 2D DDA over the spatial hash: only
+  // the grid columns the ray actually crosses are tested, and traversal stops
+  // as soon as the closest hit precedes the next cell boundary.
   rayWorldDist(ox, oy, oz, dx, dy, dz, maxDist) {
     let best = Infinity;
-    for (const b of this.boxes) {
-      let tmin = 0, tmax = maxDist;
-      // X slab
-      if (Math.abs(dx) < 1e-9) { if (ox < b.minX || ox > b.maxX) continue; }
-      else {
-        let t1 = (b.minX - ox) / dx, t2 = (b.maxX - ox) / dx;
-        if (t1 > t2) [t1, t2] = [t2, t1];
-        tmin = Math.max(tmin, t1); tmax = Math.min(tmax, t2);
-        if (tmin > tmax) continue;
-      }
-      // Y slab
-      if (Math.abs(dy) < 1e-9) { if (oy < b.y0 || oy > b.top) continue; }
-      else {
-        let t1 = (b.y0 - oy) / dy, t2 = (b.top - oy) / dy;
-        if (t1 > t2) [t1, t2] = [t2, t1];
-        tmin = Math.max(tmin, t1); tmax = Math.min(tmax, t2);
-        if (tmin > tmax) continue;
-      }
-      // Z slab
-      if (Math.abs(dz) < 1e-9) { if (oz < b.minZ || oz > b.maxZ) continue; }
-      else {
-        let t1 = (b.minZ - oz) / dz, t2 = (b.maxZ - oz) / dz;
-        if (t1 > t2) [t1, t2] = [t2, t1];
-        tmin = Math.max(tmin, t1); tmax = Math.min(tmax, t2);
-        if (tmin > tmax) continue;
-      }
-      if (tmin < best) best = tmin;
-    }
-    // ground plane
-    if (dy < -1e-9) {
+    if (dy < -1e-9) {                       // ground plane
       const tg = -oy / dy;
       if (tg > 0 && tg < best) best = tg;
     }
+    const c = this.grid.cell;
+    let cx = Math.floor(ox / c), cz = Math.floor(oz / c);
+    const stepX = dx > 1e-9 ? 1 : dx < -1e-9 ? -1 : 0;
+    const stepZ = dz > 1e-9 ? 1 : dz < -1e-9 ? -1 : 0;
+    const tDeltaX = stepX ? Math.abs(c / dx) : Infinity;
+    const tDeltaZ = stepZ ? Math.abs(c / dz) : Infinity;
+    let tMaxX = stepX ? ((stepX > 0 ? (cx + 1) * c : cx * c) - ox) / dx : Infinity;
+    let tMaxZ = stepZ ? ((stepZ > 0 ? (cz + 1) * c : cz * c) - oz) / dz : Infinity;
+
+    const tick = ++this.grid.tick;
+    const stamp = this.grid.stamp;
+    let t = 0;
+    for (let guard = 0; guard < 512; guard++) {
+      const arr = this.grid.cellAt(cx, cz);
+      if (arr) {
+        for (let i = 0; i < arr.length; i++) {
+          const bi = arr[i];
+          if (stamp[bi] === tick) continue;
+          stamp[bi] = tick;
+          const h = slabHit(this.boxes[bi], ox, oy, oz, dx, dy, dz, maxDist);
+          if (h < best) best = h;
+        }
+      }
+      if (!stepX && !stepZ) break;
+      const nextT = Math.min(tMaxX, tMaxZ);
+      if (nextT > maxDist || best <= nextT) break;  // nothing closer can exist
+      if (tMaxX < tMaxZ) { t = tMaxX; cx += stepX; tMaxX += tDeltaX; }
+      else { t = tMaxZ; cz += stepZ; tMaxZ += tDeltaZ; }
+      if (t > maxDist) break;
+    }
     return best;
+  }
+
+  // Nearest enemy hitbox along the ray. Transforms the ray into each bot's
+  // local frame and slab-tests the segmented boxes, so a headshot is an actual
+  // head intersection rather than a height comparison.
+  raycastBots(ox, oy, oz, dx, dy, dz, maxT) {
+    let bestT = maxT, bestBot = null, bestPart = null;
+    for (const b of this.bots) {
+      if (!b.alive || b.team === 0) continue;
+      // cheap reject: skip bots whose bounding sphere the ray misses
+      const rx = b.pos.x - ox, ry = (b.pos.y + 0.9) - oy, rz = b.pos.z - oz;
+      const along = rx * dx + ry * dy + rz * dz;
+      if (along < -1.2 || along > bestT + 1.2) continue;
+      const perp2 = (rx * rx + ry * ry + rz * rz) - along * along;
+      if (perp2 > 1.44) continue;                        // 1.2 m radius
+      const c = Math.cos(b.yaw), s = Math.sin(b.yaw);
+      const px = ox - b.pos.x, pz = oz - b.pos.z;
+      const lx = px * c - pz * s, lz = px * s + pz * c;
+      const ly = oy - b.pos.y;
+      const ldx = dx * c - dz * s, ldz = dx * s + dz * c;
+      for (const h of HITBOXES) {
+        const t = localSlabHit(h, lx, ly, lz, ldx, dy, ldz, bestT);
+        if (t < bestT) { bestT = t; bestBot = b; bestPart = h; }
+      }
+    }
+    return bestBot ? { bot: bestBot, t: bestT, part: bestPart } : null;
   }
 
   losBlocked(x1, y1, z1, x2, y2, z2) {
@@ -393,7 +553,10 @@ export class Game {
       ammo: L.mag, reserve: L.reserve,
       reloading: 0, shotT: 0, lastHurt: -10,
       respawnT: 0, vaultT: 0, vaultFrom: null, vaultTo: null,
+      eyeH: EYE, sprintOutT: 0,
     };
+    this.sprinting = false;
+    this.crouching = false;
     // face the arena center (forward is (-sin yaw, -cos yaw))
     this.player.yaw = Math.atan2(this.player.pos.x, this.player.pos.z);
   }
@@ -406,6 +569,7 @@ export class Game {
     this.combatants = [this.player, ...this.bots];
     this.botCtx = {
       combatants: this.combatants,
+      escalation: 0,   // 0 -> 1 across the match; drives bot speed/accuracy
       world: {
         losBlocked: (...a) => this.losBlocked(...a),
         moveEntity: (e, dx, dz) => this.moveEntity(e, dx, dz),
@@ -467,6 +631,8 @@ export class Game {
     this.scene.add(this.camera);
     this.vmKick = 0;
     this._rlPhase = -1;
+    this.sprintBlend = 0;
+    this.runT = 0;
 
     this.setupTracers();
   }
@@ -520,7 +686,9 @@ export class Game {
     mag.position.y = this.vmMagBase.y + magY;
     mag.rotation.x = magRX;
     mag.visible = magVisible;
-    this.$("reload-fill").style.width = (t * 100).toFixed(0) + "%";
+    const pctText = (t * 100).toFixed(0) + "%";
+    this.$("reload-fill").style.width = pctText;
+    this.$("reload-cuff").style.width = pctText;   // progress on the button itself
   }
 
   spawnTracer(from, to) {
@@ -565,10 +733,18 @@ export class Game {
       this.keys[e.code] = true;
       if (e.code === "KeyR") this.startReload();
       if (e.code === "Space") { e.preventDefault(); this.doVault(); }
+      if (e.code === "KeyC") this.toggleCrouch();
+      if (e.code === "ShiftLeft" || e.code === "ShiftRight") this.setSprint(true);
     };
-    const ku = e => { this.keys[e.code] = false; };
+    const ku = e => {
+      this.keys[e.code] = false;
+      if (e.code === "ShiftLeft" || e.code === "ShiftRight") this.setSprint(false);
+    };
     this.bind(window, "keydown", kd);
     this.bind(window, "keyup", ku);
+    // any focus loss drops every held input — a key/touch released off-window
+    // would otherwise stay latched and leave the player running or firing
+    this.bind(window, "blur", () => this.resetInput());
 
     // desktop: pointer lock look + click fire
     this.bind(this.canvas, "mousedown", e => {
@@ -597,6 +773,7 @@ export class Game {
     // start on HUD buttons are skipped here and handled by the buttons.
     const surface = this.$("stage");
     this.bind(surface, "touchstart", e => {
+      this.reconcileTouches(e);
       if (this.paused || this.over) return;
       for (const t of e.changedTouches) {
         if (t.target?.closest?.("button")) continue;
@@ -633,7 +810,9 @@ export class Game {
       for (const t of e.changedTouches) {
         if (t.identifier === this.stick.id) { this.stick.id = -1; this.stick.x = 0; this.stick.y = 0; }
         if (t.identifier === this.look.id) this.look.id = -1;
+        if (t.identifier === this.fireTouchId) { this.fireTouchId = -1; this.fireBtnHeld = false; this.firing = false; }
       }
+      this.reconcileTouches(e);
     };
     this.bind(surface, "touchend", touchEnd);
     this.bind(surface, "touchcancel", touchEnd);
@@ -646,14 +825,25 @@ export class Game {
       this.sfx.ensure();
       this.fireBtnHeld = true;
       this.firing = true;
+      this.setSprint(false);           // shooting always wins over sprinting
       if (e.changedTouches?.length && this.look.id === -1) {
         const t = e.changedTouches[0];
-        this.look.id = t.identifier;
+        this.fireTouchId = t.identifier;
+        this.look.id = t.identifier;   // same finger aims while it fires
         this.look.lx = t.clientX;
         this.look.ly = t.clientY;
       }
     };
-    const fend = e => { e.preventDefault(); this.fireBtnHeld = false; if (!this.pointerLocked) this.firing = false; };
+    const fend = e => {
+      e.preventDefault();
+      this.fireBtnHeld = false;
+      if (!this.pointerLocked) this.firing = false;
+      // release the look claim so the finger can't leave the camera latched
+      if (this.fireTouchId !== -1) {
+        if (this.look.id === this.fireTouchId) this.look.id = -1;
+        this.fireTouchId = -1;
+      }
+    };
     this.bind(fireBtn, "touchstart", fstart, { passive: false });
     this.bind(fireBtn, "touchend", fend, { passive: false });
     // Android turns a held touch into a system gesture via touchcancel —
@@ -664,6 +854,8 @@ export class Game {
     this.bind(this.$("btn-reload"), "click", () => this.startReload());
     this.bind(this.$("btn-vault"), "click", () => this.doVault());
     this.bind(this.$("btn-ads"), "click", () => this.toggleAds());
+    this.bind(this.$("btn-sprint"), "click", () => this.setSprint(!this.sprinting));
+    this.bind(this.$("btn-crouch"), "click", () => this.toggleCrouch());
 
     // mobile: tabbing away / locking the screen pauses the match
     this.bind(document, "visibilitychange", () => {
@@ -763,10 +955,6 @@ export class Game {
     p.hp -= dmg;
     p.lastHurt = this.time;
     this.sfx.hurt();
-    const v = this.$("dmg-vignette");
-    v.style.opacity = Math.min(1, 0.35 + (100 - p.hp) / 120);
-    clearTimeout(this._vt);
-    this._vt = setTimeout(() => { v.style.opacity = p.hp < 35 ? 0.4 : 0; }, 220);
     if (p.hp <= 0) this.playerDie(attacker);
   }
 
@@ -784,7 +972,6 @@ export class Game {
     if (killer) killer.kills = (killer.kills || 0) + 1;
     this.addFeed(killer ? killer.name : "RAVENGLASS", p.name, false);
     this.setPrompt("REDEPLOYING · STAND BY");
-    this.$("dmg-vignette").style.opacity = 0.85;
     this.checkEnd();
   }
 
@@ -825,15 +1012,105 @@ export class Game {
     if (!p.alive || p.reloading > 0 || p.ammo >= L.mag || p.reserve <= 0) return;
     p.reloading = L.reloadTime;
     this._rlPhase = -1;
+    this.setSprint(false);            // both hands on the weapon
     this.moveLabel = "RELOADING";
     this.setPrompt(`MAG SWAP · ${L.reloadTime.toFixed(1)}s`);
     this.$("reload-fill").style.width = "0%";
+    this.$("reload-cuff").style.width = "0%";
     this.$("reload-ring").style.display = "flex";
   }
 
   toggleAds() {
     if (!this.player.alive || this.paused || this.over) return;
     this.adsOn = !this.adsOn;
+    if (this.adsOn) this.setSprint(false); // can't aim down sights at a run
+  }
+
+  setSprint(on) {
+    if (on && (!this.player.alive || this.paused || this.over || this.crouching)) return;
+    if (on === this.sprinting) return;
+    this.sprinting = on;
+    if (on) {
+      this.adsOn = false;
+    } else {
+      // leaving sprint costs a short raise time before the gun can fire
+      this.player.sprintOutT = SPRINT_OUT;
+    }
+  }
+
+  toggleCrouch() {
+    if (!this.player.alive || this.paused || this.over) return;
+    if (!this.crouching) {
+      this.crouching = true;
+      this.setSprint(false);
+      return;
+    }
+    // only stand back up if there is headroom (never clip into a container)
+    const p = this.player;
+    if (this.collides(p.pos.x, p.pos.z, p.radius, p.pos.y, p.pos.y + 1.8)) {
+      this.setPrompt("NO HEADROOM · STAY LOW");
+      return;
+    }
+    this.crouching = false;
+  }
+
+  // Every tracked touch id is re-checked against the live touch list on every
+  // touch event. Android can drop a touchend (system gesture, palm rejection,
+  // identifier reuse), which used to leave the stick latched — the player then
+  // ran into a wall forever and could not act.
+  reconcileTouches(e) {
+    const live = new Set();
+    for (const t of e.touches) live.add(t.identifier);
+    if (this.stick.id !== -1 && !live.has(this.stick.id)) {
+      this.stick.id = -1; this.stick.x = 0; this.stick.y = 0;
+    }
+    if (this.look.id !== -1 && !live.has(this.look.id)) this.look.id = -1;
+    if (this.fireTouchId !== -1 && !live.has(this.fireTouchId)) {
+      this.fireTouchId = -1; this.fireBtnHeld = false; this.firing = false;
+    }
+    if (live.size === 0) {
+      // nothing is touching the screen: no input may remain held
+      this.stick.id = -1; this.stick.x = 0; this.stick.y = 0;
+      this.look.id = -1;
+      this.fireTouchId = -1;
+      this.fireBtnHeld = false;
+      if (!this.pointerLocked) this.firing = false;
+    }
+  }
+
+  resetInput() {
+    this.keys = {};
+    this.stick.id = -1; this.stick.x = 0; this.stick.y = 0;
+    this.look.id = -1;
+    this.fireTouchId = -1;
+    this.fireBtnHeld = false;
+    this.firing = false;
+    this.sprinting = false;
+  }
+
+  // Push the player out of any box they are overlapping. Without this, ending
+  // up inside geometry fails BOTH axis tests in moveEntity forever — the
+  // "stuck and can't move" report. Costs one pass over the AABB list.
+  unstick(e) {
+    const r = e.radius, feet = e.pos.y, head = e.pos.y + (e.height || 1.8);
+    for (const b of this.boxes) {
+      if (b.top <= feet + 0.05 || b.y0 >= head) continue;   // standing on / under it
+      if (e.pos.x + r <= b.minX || e.pos.x - r >= b.maxX) continue;
+      if (e.pos.z + r <= b.minZ || e.pos.z - r >= b.maxZ) continue;
+      const outMinX = (e.pos.x + r) - b.minX;   // distance to escape via -x
+      const outMaxX = b.maxX - (e.pos.x - r);
+      const outMinZ = (e.pos.z + r) - b.minZ;
+      const outMaxZ = b.maxZ - (e.pos.z - r);
+      const m = Math.min(outMinX, outMaxX, outMinZ, outMaxZ);
+      if (m === outMinX) e.pos.x -= m + 0.02;
+      else if (m === outMaxX) e.pos.x += m + 0.02;
+      else if (m === outMinZ) e.pos.z -= m + 0.02;
+      else e.pos.z += m + 0.02;
+    }
+    const lim = ARENA - 0.15;
+    e.pos.x = Math.max(-lim, Math.min(lim, e.pos.x));
+    e.pos.z = Math.max(-lim, Math.min(lim, e.pos.z));
+    if (e.pos.y < -2) { e.pos.copy(this.spawnFor(e.team)); e.vy = 0; } // fell out of the world
   }
 
   doVault() {
@@ -877,6 +1154,7 @@ export class Game {
   tryFire() {
     const p = this.player, L = this.loadout;
     if (!p.alive || p.reloading > 0) return;
+    if (this.sprinting || p.sprintOutT > 0) return; // gun is down / coming up
     if (p.shotT > 0) return;
     if (p.ammo <= 0) { this.startReload(); return; }
     if (!L.auto && this._semiHeld) return;
@@ -890,7 +1168,8 @@ export class Game {
 
     // spread: hip vs ADS interpolated by aim progress, movement penalty fades while aimed
     const aim = this.ads;
-    const spreadMult = L.hipSpreadMult + (L.adsSpreadMult - L.hipSpreadMult) * aim;
+    const spreadMult = (L.hipSpreadMult + (L.adsSpreadMult - L.hipSpreadMult) * aim)
+      * (this.crouching ? 0.62 : 1);          // crouching steadies the weapon
     const moveP = p.speedVal > 0.5 ? L.moveSpreadDeg * (1 - 0.7 * aim) : 0;
     const spread = (L.spreadDeg * spreadMult + moveP) * Math.PI / 180;
     const yawOff = (Math.random() - 0.5) * spread;
@@ -899,25 +1178,15 @@ export class Game {
     const dx = -Math.sin(yaw) * Math.cos(pitch);
     const dy = Math.sin(pitch);
     const dz = -Math.cos(yaw) * Math.cos(pitch);
-    const ox = p.pos.x, oy = p.pos.y + EYE, oz = p.pos.z;
+    const ox = p.pos.x, oy = p.pos.y + p.eyeH, oz = p.pos.z;
 
     const wallT = this.rayWorldDist(ox, oy, oz, dx, dy, dz, 200);
-
-    // ray vs bot capsules (vertical segment + radius)
-    let hitBot = null, hitT = Infinity, headshot = false;
-    for (const b of this.bots) {
-      if (!b.alive || b.team === 0) continue;
-      // closest approach of ray to vertical segment at (b.x,z), y in [y, y+1.8]
-      const cx = b.pos.x - ox, cz = b.pos.z - oz;
-      const tFlat = (cx * dx + cz * dz) / (dx * dx + dz * dz + 1e-9);
-      if (tFlat < 0 || tFlat > Math.min(wallT, 200)) continue;
-      const hx = ox + dx * tFlat, hz = oz + dz * tFlat;
-      const distSq = (hx - b.pos.x) ** 2 + (hz - b.pos.z) ** 2;
-      if (distSq > 0.42 * 0.42) continue;
-      const hy = oy + dy * tFlat;
-      if (hy < b.pos.y || hy > b.pos.y + 1.86) continue;
-      if (tFlat < hitT) { hitT = tFlat; hitBot = b; headshot = hy > b.pos.y + 1.5; }
-    }
+    // bots are only hittable in front of whatever the round would strike first
+    const shot = this.raycastBots(ox, oy, oz, dx, dy, dz, Math.min(wallT, 200));
+    const hitBot = shot?.bot ?? null;
+    const hitT = shot?.t ?? Infinity;
+    const part = shot?.part ?? null;
+    const headshot = part?.name === "HEAD";
 
     // muzzle flash DOM + 3D
     const mz = this.$("muzzle");
@@ -934,7 +1203,7 @@ export class Game {
     hudEl.classList.remove("kick"); void hudEl.offsetWidth; hudEl.classList.add("kick");
 
     if (hitBot) {
-      let dmg = L.damage * (headshot ? L.headshotMult : 1);
+      let dmg = L.damage * part.mult;          // per-limb multiplier
       const dist = hitT;
       if (dist > L.falloffStart) {
         const f = Math.max(0.45, 1 - (dist - L.falloffStart) / Math.max(1, L.falloffEnd - L.falloffStart) * 0.55);
@@ -945,7 +1214,7 @@ export class Game {
       hm.classList.remove("show", "head"); void hm.offsetWidth;
       hm.classList.add("show"); if (headshot) hm.classList.add("head");
       const killed = hitBot.damage(dmg, this.player, this.botCtx);
-      if (!killed) this.setPrompt(`TARGET · ${Math.round(dist)}m · ${headshot ? "HEADSHOT" : "CENTER MASS"}`);
+      if (!killed) this.setPrompt(`TARGET · ${Math.round(dist)}m · ${part.name}`);
     }
 
     if (p.ammo === 0) this.startReload();
@@ -966,7 +1235,6 @@ export class Game {
         p.yaw = Math.atan2(p.pos.x, p.pos.z);
         p.ammo = L.mag; p.reserve = L.reserve; p.reloading = 0;
         this.$("reload-ring").style.display = "none";
-        this.$("dmg-vignette").style.opacity = 0;
         this.setPrompt("HOLD LEFT EDGE TO SLIDE");
         this.moveLabel = "SPRINT";
       }
@@ -995,16 +1263,23 @@ export class Game {
         mx += this.stick.x; mz += this.stick.y;
         const mlen = Math.hypot(mx, mz);
         if (mlen > 1) { mx /= mlen; mz /= mlen; }
+        // sprint only holds while genuinely moving forward
+        if (this.sprinting && (mlen < 0.35 || mz > 0.4)) this.setSprint(false);
+        if (this.keys["ShiftLeft"] && mlen > 0.35 && !this.crouching) this.setSprint(true);
+
         const sin = Math.sin(p.yaw), cos = Math.cos(p.yaw);
         const wx = (-sin * -mz) + (cos * mx);
         const wz = (-cos * -mz) + (-sin * mx);
-        const speed = L.moveSpeed * (1 + (L.adsMoveMult - 1) * this.ads);
+        let speed = L.moveSpeed * (1 + (L.adsMoveMult - 1) * this.ads);
+        if (this.sprinting) speed *= SPRINT_MULT;
+        if (this.crouching) speed *= CROUCH_MULT;
         this.moveEntity(p, wx * speed * dt, wz * speed * dt);
         p.speedVal = mlen * speed;
         if (p.reloading <= 0 && p.vaultT <= 0 && !this.firing && p.grounded) {
-          this.moveLabel = this.ads > 0.6
-            ? (L.scope ? "SCOPED" : "ADS")
-            : mlen > 0.05 ? (mlen > 0.75 ? "SPRINT" : "MOVE") : "HOLD";
+          this.moveLabel = this.sprinting ? "SPRINT"
+            : this.crouching ? "CROUCH"
+            : this.ads > 0.6 ? (L.scope ? "SCOPED" : "ADS")
+            : mlen > 0.05 ? "MOVE" : "HOLD";
         }
 
         // gravity / ground
@@ -1013,7 +1288,14 @@ export class Game {
         p.pos.y += p.vy * dt;
         if (p.pos.y <= ground) { p.pos.y = ground; p.vy = 0; p.grounded = true; }
         else if (p.pos.y > ground + 0.05) p.grounded = false;
+        this.unstick(p);
       }
+
+      // stance: collision height and eye height follow the crouch state
+      p.height = this.crouching ? 1.2 : 1.8;
+      const wantEye = this.crouching ? EYE_CROUCH : EYE;
+      p.eyeH += (wantEye - p.eyeH) * Math.min(1, dt * 12);
+      if (p.sprintOutT > 0) p.sprintOutT -= dt;
 
       // reload
       if (p.reloading > 0) {
@@ -1023,8 +1305,9 @@ export class Game {
           const take = Math.min(need, p.reserve);
           p.ammo += take; p.reserve -= take;
           this.$("reload-ring").style.display = "none";
-          this.moveLabel = "SPRINT";
-          this.setPrompt("HOLD LEFT EDGE TO SLIDE");
+          this.$("reload-cuff").style.width = "0%";
+          this.moveLabel = "HOLD";
+          this.setPrompt("");
         }
       }
 
@@ -1034,13 +1317,33 @@ export class Game {
       else this._semiHeld = false;
 
       // hp regen after 4s
-      if (p.hp < 100 && this.timeSinceHurt() > 4) {
-        p.hp = Math.min(100, p.hp + 14 * dt);
-        if (p.hp > 35) this.$("dmg-vignette").style.opacity = 0;
-      }
+      if (p.hp < 100 && this.timeSinceHurt() > 4) p.hp = Math.min(100, p.hp + 14 * dt);
     }
 
     // ---- bots ----
+    // Escalation ramps with whichever is further along: elapsed time or the
+    // leading score. Late rounds are faster, sharper and more aggressive.
+    const byTime = 1 - this.time / MATCH.timeLimit;
+    const byScore = Math.max(this.score[0], this.score[1]) / MATCH.killTarget;
+    this.botCtx.escalation = Math.min(1, Math.max(byTime, byScore));
+
+    // periodic coordinated push: a fireteam commits on the player's position
+    this.pushTimer -= dt;
+    if (this.pushTimer <= 0) {
+      this.pushTimer = 22 - 10 * this.botCtx.escalation;
+      if (this.player.alive) {
+        const squad = this.bots
+          .filter(b => b.team === 1 && b.alive)
+          .sort((x, y) => x.pos.distanceTo(this.player.pos) - y.pos.distanceTo(this.player.pos))
+          .slice(0, 2 + Math.round(this.botCtx.escalation * 2));
+        for (const b of squad) {
+          b.pushT = 6;
+          b.goal = this.player.pos.clone();
+          b.repathT = 6;
+        }
+      }
+    }
+
     for (const b of this.bots) {
       b.update(dt, this.botCtx);
       if (b.mesh) {
@@ -1052,7 +1355,7 @@ export class Game {
     this.updateTracers(dt);
 
     // ---- camera ----
-    this.camera.position.set(p.pos.x, p.pos.y + EYE, p.pos.z);
+    this.camera.position.set(p.pos.x, p.pos.y + p.eyeH, p.pos.z);
     this.camera.rotation.order = "YXZ";
     this.camera.rotation.y = p.yaw;
     this.camera.rotation.x = p.pitch;
@@ -1074,6 +1377,22 @@ export class Game {
       this.animateReload(1 - p.reloading / this.loadout.reloadTime);
     } else {
       this._rlPhase = -1;
+    }
+
+    // sprint pose: weapon canted down and across, with a two-step run bob.
+    // sprintBlend also covers the raise back to centre via sprintOutT.
+    const wantSprint = (this.sprinting && p.alive) ? 1
+      : p.sprintOutT > 0 ? p.sprintOutT / SPRINT_OUT : 0;
+    this.sprintBlend += (wantSprint - this.sprintBlend) * Math.min(1, dt * 11);
+    if (this.sprintBlend > 0.002) {
+      const s = this.sprintBlend;
+      this.runT += dt * 11;
+      vm.rotation.z += 0.55 * s;
+      vm.rotation.x += 0.42 * s;
+      vm.rotation.y += 0.30 * s;
+      vm.position.y += (-0.13 + Math.sin(this.runT) * 0.022) * s;
+      vm.position.x += (0.06 + Math.cos(this.runT * 0.5) * 0.012) * s;
+      vm.position.z += 0.05 * s;
     }
     this.vmKick = Math.max(0, this.vmKick - dt * 9);
     vm.position.z += this.vmKick * 0.06;
@@ -1118,6 +1437,18 @@ export class Game {
       v => { this.$("scope-overlay").style.display = v ? "block" : "none"; });
     this.hudSet("adsBtn", this.adsOn,
       v => this.$("btn-ads").classList.toggle("on", v));
+    // vignette is derived from state every frame, never from a timer that a
+    // respawn or a forced heal could outlive
+    const hurtAge = this.timeSinceHurt();
+    const vig = !p.alive ? 0.85
+      : hurtAge < 0.25 ? Math.min(1, 0.35 + (100 - p.hp) / 120)
+      : p.hp < 35 ? 0.4
+      : 0;
+    this.hudSet("vig", vig.toFixed(2), v => { this.$("dmg-vignette").style.opacity = v; });
+    this.hudSet("sprintBtn", this.sprinting,
+      v => this.$("btn-sprint").classList.toggle("on", v));
+    this.hudSet("crouchBtn", this.crouching,
+      v => this.$("btn-crouch").classList.toggle("on", v));
 
     // compass: strip spans are 55px per 45°
     const yawDeg = ((-this.player.yaw * 180 / Math.PI) % 360 + 360) % 360;

@@ -20,6 +20,7 @@ function showScreen(name) {
   $("hud").classList.remove("active");
   if (name === "hud") $("hud").classList.add("active");
   else $("screen-" + name)?.classList.add("active");
+  document.body.classList.toggle("in-match", name === "hud");
 }
 
 /* ---------------- boot sequence ---------------- */
@@ -386,8 +387,14 @@ function initOverlays() {
   };
   // Android back gesture: swallow the pop, re-arm the sentinel, pause
   window.addEventListener("popstate", () => {
-    if (state.game && !state.game.over) {
-      history.pushState({ inMatch: 1 }, "");
+    if (!state.game) return;
+    history.pushState({ inMatch: 1 }, "");
+    if (state.game.over) {
+      // match already finished: back always returns to the lobby
+      $("overlay-end").classList.remove("active");
+      endGame();
+      goto("lobby");
+    } else {
       pauseMatch();
     }
   });

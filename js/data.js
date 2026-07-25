@@ -109,7 +109,7 @@ export function buildLoadout(weaponIdx, atts) {
     weaponIdx, atts: atts.slice(),
     name: w.name, cls: w.cls, auto: w.auto,
     damage: 10 + dmg * (w.dmgScale ?? 0.45),    // sniper one-shots, DMR 2-shots, AR 3-shots
-    headshotMult: 1.5,
+    // per-limb multipliers live on the hitbox model in game.js
     rpm: w.rpm * (1 + (fr - w.base[5]) / 220),
     falloffStart: 10 + rng * 0.32,              // meters, then linear decay
     falloffEnd: 30 + rng * 0.62,

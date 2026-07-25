@@ -3,11 +3,37 @@
 // 6v6 team-deathmatch score keeps moving even when the player is repositioning.
 import * as THREE from "three";
 
-const TURN_RATE = 5.2;          // rad/s
-const ACQUIRE_INTERVAL = 0.4;
-const VIEW_RANGE = 55;
-const FIRE_RANGE = 46;
+const ACQUIRE_INTERVAL = 0.3;
 const AIM_CONE = 0.13;          // rad — must face target this closely to shoot
+
+/* Archetypes give each bot a distinct threat profile instead of one averaged
+   behaviour: a rusher closes and brawls, a marksman holds angles at range, a
+   flanker takes wide routes, an anchor holds ground and suppresses. */
+const ARCHETYPES = [
+  {
+    name: "RUSHER", weight: 3,
+    speed: 5.2, sprint: 1.34, turn: 6.6, view: 52, fireRange: 30, idealMin: 3, idealMax: 14,
+    rpm: 820, dmg: 9, burst: [5, 9], pause: [0.24, 0.55], react: [0.16, 0.30], acc: 0.74, strafe: 1.5,
+  },
+  {
+    name: "MARKSMAN", weight: 2,
+    speed: 3.5, sprint: 1.15, turn: 4.4, view: 78, fireRange: 74, idealMin: 26, idealMax: 55,
+    rpm: 260, dmg: 26, burst: [1, 2], pause: [0.75, 1.35], react: [0.30, 0.62], acc: 0.9, strafe: 0.5,
+  },
+  {
+    name: "FLANKER", weight: 3,
+    speed: 4.8, sprint: 1.3, turn: 5.8, view: 58, fireRange: 40, idealMin: 6, idealMax: 22,
+    rpm: 700, dmg: 11, burst: [4, 7], pause: [0.35, 0.7], react: [0.20, 0.38], acc: 0.78, strafe: 1.35,
+  },
+  {
+    name: "ANCHOR", weight: 2,
+    speed: 4.0, sprint: 1.2, turn: 5.0, view: 62, fireRange: 52, idealMin: 12, idealMax: 34,
+    rpm: 600, dmg: 14, burst: [3, 6], pause: [0.45, 0.9], react: [0.24, 0.46], acc: 0.82, strafe: 0.9,
+  },
+];
+
+const ARCH_BAG = ARCHETYPES.flatMap(a => Array(a.weight).fill(a));
+const rand = (lo, hi) => lo + Math.random() * (hi - lo);
 
 const _v = new THREE.Vector3();
 const _dir = new THREE.Vector3();
@@ -25,9 +51,16 @@ export class Bot {
     this.hp = 100;
     this.alive = false;
     this.respawnT = 0.5 + Math.random() * 1.2;
-    this.speedVal = 3.4 + Math.random() * 0.7;
     this.radius = 0.45;
     this.height = 1.8;
+
+    const a = ARCH_BAG[Math.floor(Math.random() * ARCH_BAG.length)];
+    this.arch = a;
+    this.baseSpeed = a.speed * rand(0.94, 1.08);
+    this.speedVal = this.baseSpeed;
+    this.reactT = 0;               // counts down once a target is seen
+    this.sprintUntil = 0;
+    this.pushT = 0;
 
     this.target = null;
     this.acquireT = Math.random() * ACQUIRE_INTERVAL;
@@ -38,12 +71,12 @@ export class Bot {
     this.strafeT = 0;
     this.strafeDir = 1;
 
-    // weapon feel per bot: rpm + burst cadence
-    this.rpm = weapon?.rpm ?? (520 + Math.random() * 240);
-    this.dmg = weapon?.dmg ?? (9 + Math.random() * 4);
+    // weapon feel follows the archetype
+    this.rpm = weapon?.rpm ?? a.rpm * rand(0.92, 1.08);
+    this.dmg = weapon?.dmg ?? a.dmg * rand(0.9, 1.1);
     this.shotT = 0;
     this.burstLeft = 0;
-    this.burstPauseT = 0.4 + Math.random();
+    this.burstPauseT = rand(a.pause[0], a.pause[1]);
 
     this.kills = 0;
     this.deaths = 0;
@@ -104,6 +137,16 @@ export class Bot {
 
     const t = this.target;
     const visible = t && t.alive && this.canSee(t, ctx);
+    const a = this.arch;
+    // difficulty ramps across the match: later rounds are faster and sharper
+    const esc = ctx.escalation ?? 0;
+
+    // reaction time: a bot that just spotted someone cannot fire instantly
+    if (visible) {
+      if (this.reactT > 0) this.reactT -= dt;
+    } else {
+      this.reactT = rand(a.react[0], a.react[1]) * (1 - 0.45 * esc);
+    }
 
     // --- decide desired movement ---
     let desired = null; // normalized dir on XZ
@@ -113,13 +156,19 @@ export class Bot {
       const fwd = _dir.clone().normalize();
       this.strafeT -= dt;
       if (this.strafeT <= 0) {
-        this.strafeT = 0.7 + Math.random() * 1.1;
+        this.strafeT = rand(0.45, 1.15) / a.strafe;
         this.strafeDir = Math.random() < 0.5 ? -1 : 1;
       }
       const side = new THREE.Vector3(-fwd.z, 0, fwd.x).multiplyScalar(this.strafeDir);
-      if (dist > 20) desired = fwd.clone().multiplyScalar(0.85).add(side.multiplyScalar(0.4)).normalize();
-      else if (dist < 8) desired = fwd.clone().multiplyScalar(-0.5).add(side.multiplyScalar(0.9)).normalize();
-      else desired = side.normalize();
+      // hold the archetype's preferred engagement band
+      if (dist > a.idealMax) {
+        desired = fwd.clone().multiplyScalar(0.9).add(side.multiplyScalar(0.35 * a.strafe)).normalize();
+      } else if (dist < a.idealMin) {
+        desired = fwd.clone().multiplyScalar(-0.6).add(side.multiplyScalar(0.85)).normalize();
+      } else {
+        desired = side.normalize().multiplyScalar(a.strafe > 1 ? 1 : 0.65);
+        if (desired.lengthSq() < 0.01) desired = null;
+      }
     } else {
       // hunt: head toward last known opponent area or wander
       this.repathT -= dt;
@@ -146,6 +195,12 @@ export class Bot {
     }
 
     // --- move with collision ---
+    // sprint to close ground when out of contact or ordered to push
+    const wantSprint = !visible || this.pushT > 0 ||
+      (t && t.alive && this.pos.distanceTo(t.pos) > a.idealMax * 1.4);
+    this.speedVal = this.baseSpeed * (1 + 0.22 * esc) * (wantSprint ? a.sprint : 1);
+    if (this.pushT > 0) this.pushT -= dt;
+
     let movedFrac = 1;
     if (desired) {
       const step = this.speedVal * dt;
@@ -168,7 +223,8 @@ export class Bot {
       let diff = wantYaw - this.yaw;
       while (diff > Math.PI) diff -= Math.PI * 2;
       while (diff < -Math.PI) diff += Math.PI * 2;
-      const turn = Math.sign(diff) * Math.min(Math.abs(diff), TURN_RATE * dt);
+      const turnRate = a.turn * (1 + 0.3 * esc);
+      const turn = Math.sign(diff) * Math.min(Math.abs(diff), turnRate * dt);
       this.yaw += turn;
       facingTarget = Math.abs(diff) < AIM_CONE;
     } else if (desired) {
@@ -176,24 +232,24 @@ export class Bot {
       let diff = wantYaw - this.yaw;
       while (diff > Math.PI) diff -= Math.PI * 2;
       while (diff < -Math.PI) diff += Math.PI * 2;
-      this.yaw += Math.sign(diff) * Math.min(Math.abs(diff), TURN_RATE * 0.6 * dt);
+      this.yaw += Math.sign(diff) * Math.min(Math.abs(diff), a.turn * 0.6 * dt);
     }
 
     // --- fire control ---
     this.shotT -= dt;
-    if (visible && facingTarget) {
+    if (visible && facingTarget && this.reactT <= 0) {
       const dist = this.pos.distanceTo(t.pos);
-      if (dist < FIRE_RANGE) {
+      if (dist < a.fireRange) {
         if (this.burstLeft <= 0) {
           this.burstPauseT -= dt;
           if (this.burstPauseT <= 0) {
-            this.burstLeft = 3 + Math.floor(Math.random() * 4);
-            this.burstPauseT = 0.55 + Math.random() * 0.9;
+            this.burstLeft = Math.round(rand(a.burst[0], a.burst[1]));
+            this.burstPauseT = rand(a.pause[0], a.pause[1]) * (1 - 0.35 * esc);
           }
         } else if (this.shotT <= 0) {
           this.shotT = 60 / this.rpm;
           this.burstLeft--;
-          this.fireAt(t, dist, ctx);
+          this.fireAt(t, dist, ctx, esc);
         }
       }
     } else {
@@ -202,13 +258,18 @@ export class Bot {
   }
 
   acquire(ctx) {
-    let best = null, bestD = Infinity;
+    let best = null, bestScore = Infinity;
     let nearest = null, nearestD = Infinity;
     for (const e of ctx.combatants) {
       if (e === this || e.team === this.team || !e.alive) continue;
       const d = this.pos.distanceTo(e.pos);
       if (d < nearestD) { nearestD = d; nearest = e; }
-      if (d < VIEW_RANGE && d < bestD && this.canSee(e, ctx)) { bestD = d; best = e; }
+      if (d > this.arch.view || !this.canSee(e, ctx)) continue;
+      // prefer targets inside the preferred band, and favour the human so
+      // the player is meaningfully contested rather than ignored
+      const band = Math.abs(d - (this.arch.idealMin + this.arch.idealMax) / 2);
+      const score = band * (e.isPlayer ? 0.55 : 1);
+      if (score < bestScore) { bestScore = score; best = e; }
     }
     // keep hunting the nearest opponent even without sight
     this.target = best || this.target || nearest;
@@ -222,13 +283,20 @@ export class Bot {
     );
   }
 
-  fireAt(t, dist, ctx) {
-    // accuracy: distance + target speed + own movement
+  fireAt(t, dist, ctx, esc = 0) {
+    // accuracy: archetype skill, range falloff, target and self motion,
+    // all sharpened as the match escalates
+    const a = this.arch;
     const targetSpeed = t.isPlayer ? (t.speedVal || 0) : t.moving;
-    let p = 0.82 - dist * 0.011 - targetSpeed * 0.045 - this.moving * 0.03;
-    p = Math.max(0.05, Math.min(0.8, p));
+    const rangeFactor = Math.max(0, dist - a.idealMax) * 0.012;
+    let p = a.acc * (0.82 + 0.3 * esc)
+      - rangeFactor
+      - targetSpeed * 0.038
+      - this.moving * 0.028;
+    if (t.isPlayer && t.crouching) p -= 0.05;   // smaller silhouette
+    p = Math.max(0.05, Math.min(0.92, p));
     const hit = Math.random() < p;
-    const dmg = this.dmg * (0.85 + Math.random() * 0.3);
+    const dmg = this.dmg * (0.85 + Math.random() * 0.3) * (1 + 0.25 * esc);
     ctx.events.onBotShot(this, t, hit, hit ? dmg : 0);
   }
 }
