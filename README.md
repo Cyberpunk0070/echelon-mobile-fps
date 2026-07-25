@@ -139,14 +139,21 @@ Controls sit in two thumb clusters with a guaranteed-empty centre channel,
 positioned off shared layout tokens (`--edge-*`, `--col2-*`) that also absorb
 the punch-hole and gesture-bar safe areas, so no two controls can collide.
 
+Input is built on **Pointer Events with one independent stream per finger** —
+every control acts on `pointerdown` and owns its `pointerId`, with pointer
+capture guaranteeing the matching release. Nothing uses `click`, which is
+single-pointer and gets suppressed once `preventDefault()` runs on another
+active touch; that was why only one control worked at a time. Move, look,
+fire, ADS and reload can all be active simultaneously.
+
 | Action | Touch | Desktop |
 |---|---|---|
 | Move | left-side virtual stick | WASD |
 | Look | drag right side | mouse (click canvas for pointer lock) |
 | Fire | hold FIRE | left mouse |
 | Aim while firing | drag from the FIRE button | mouse (always free) |
-| ADS / scope | ADS button (toggle) | hold right mouse |
-| Sprint | SPRINT | Shift |
+| ADS / scope | hold ADS | hold right mouse |
+| Sprint | push the move stick to the outer ring | Shift |
 | Crouch | CROUCH | C |
 | Reload | RELOAD | R |
 | Jump / vault | JUMP | Space |
