@@ -65,9 +65,20 @@ always run it (or `npx cap sync`) after editing `index.html` / `js/**`.
   attachment slots (with the design's exact stat deltas) feed actual ballistics:
   damage, RPM, falloff, spread, recoil, move speed, mag size, reload time.
 - **Team deathmatch vs AI** — 6v6 on Ravenglass Dockyard (player + 5 ally bots
-  vs 6 enemy bots). Bots have line-of-sight checks, hunt/strafe/burst-fire
-  behavior, target switching when shot, respawns, and fight each other so the
-  score keeps moving. First team to 40 kills or best score at 8:00 wins.
+  vs 6 enemy bots). Bots come in four archetypes — RUSHER, MARKSMAN, FLANKER,
+  ANCHOR — each with its own speed, preferred engagement band, burst cadence,
+  accuracy and reaction delay, so they can't all be read the same way. They do
+  line-of-sight checks, hold their band, retarget when shot, and fight each
+  other. Difficulty escalates with match progress (whichever is further along,
+  the clock or the leading score), and a fireteam periodically commits a
+  coordinated push onto the player. First to 40 kills or best score at 8:00.
+- **Movement**: sprint (1.5×, weapon lowered with a run bob, 0.18 s to raise
+  before you can fire), crouch (0.52× speed, lower profile, 0.62× spread, and
+  it refuses to stand up without headroom), jump and ledge mantling.
+- **Anti-lockout**: the player is depenetrated from any geometry they end up
+  inside, recovers from falls out of the world, and every touch id is
+  reconciled against the live touch list each event — a dropped `touchend`
+  from an Android system gesture can no longer latch the stick or the trigger.
 - **CoD-style shooting**: the FIRE button doubles as an aim pad — hold it and
   drag to track a target while the gun is firing. ADS vs hip-fire is a real
   model: aiming interpolates fov, spread, movement speed and look sensitivity
@@ -96,6 +107,12 @@ Measured 144 fps in-browser on a 144 Hz desktop panel with 78 draw calls.
 - **Instanced world**: every static box is drawn from one shared unit-box
   geometry through one `InstancedMesh` per color — the whole dockyard is 6 draw
   calls instead of ~110.
+- **Broadphase**: a uniform spatial hash indexes the world AABBs; collision and
+  ground queries test only the overlapping cells, and rays walk the grid with a
+  2D DDA that stops as soon as the nearest hit precedes the next cell boundary.
+- **Segmented hitboxes**: HEAD (2.0×) / CHEST (1.0×) / ABDOMEN (0.9×) /
+  LEGS (0.75×) slab-tested in each bot's local frame, replacing the old
+  cylinder-plus-height-threshold headshot approximation.
 - **Pooled tracers**: all bullet tracers live in a single `LineSegments` over a
   fixed buffer, so sustained crossfire allocates nothing and can't cause GC
   hitches. Total scene geometry count stays at 3.
@@ -118,6 +135,10 @@ Measured 144 fps in-browser on a 144 Hz desktop panel with 78 draw calls.
 
 ## Controls
 
+Controls sit in two thumb clusters with a guaranteed-empty centre channel,
+positioned off shared layout tokens (`--edge-*`, `--col2-*`) that also absorb
+the punch-hole and gesture-bar safe areas, so no two controls can collide.
+
 | Action | Touch | Desktop |
 |---|---|---|
 | Move | left-side virtual stick | WASD |
@@ -125,9 +146,11 @@ Measured 144 fps in-browser on a 144 Hz desktop panel with 78 draw calls.
 | Fire | hold FIRE | left mouse |
 | Aim while firing | drag from the FIRE button | mouse (always free) |
 | ADS / scope | ADS button (toggle) | hold right mouse |
+| Sprint | SPRINT | Shift |
+| Crouch | CROUCH | C |
 | Reload | RELOAD | R |
-| Vault / jump | VAULT | Space |
-| Pause | MENU | Esc |
+| Jump / vault | JUMP | Space |
+| Pause | MENU | Esc / back gesture |
 
 ## Files
 
