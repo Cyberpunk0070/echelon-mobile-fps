@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>ECHELON · LINK PROBE</title>
+<style>
+  :root{
+    --bg:#151312; --surface:#211f1e; --line:#332f2d;
+    --text:#f3f2f2; --dim:#8a8380; --red:#ff563c;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    background:var(--bg); color:var(--text);
+    font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+    font-size:13px; line-height:1.45;
+    padding:18px 16px 40px; max-width:660px; margin:0 auto;
+    -webkit-text-size-adjust:100%;
+  }
+  h1{
+    font-size:19px; font-weight:800; letter-spacing:.14em;
+    text-transform:uppercase; margin-bottom:2px;
+  }
+  .sub{color:var(--dim); font-size:11px; letter-spacing:.16em; text-transform:uppercase}
+  .rule{height:1px;background:var(--line);margin:14px 0}
+  .accent{display:inline-block;width:26px;height:3px;background:var(--red);margin-bottom:12px}
+
+  button{
+    font:inherit; font-weight:700; letter-spacing:.14em; text-transform:uppercase;
+    background:var(--red); color:#151312; border:0; border-radius:0;
+    padding:15px 20px; width:100%; cursor:pointer; margin-top:4px;
+  }
+  button:disabled{background:var(--surface);color:var(--dim);cursor:default}
+  button.ghost{background:transparent;color:var(--text);border:1px solid var(--line)}
+
+  .status{
+    display:flex;justify-content:space-between;align-items:baseline;gap:10px;
+    font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);
+    margin:14px 0 6px;
+  }
+  .status b{color:var(--red);font-weight:700}
+
+  .bar{height:3px;background:var(--surface);overflow:hidden}
+  .bar i{display:block;height:100%;width:0;background:var(--red);transition:width .2s linear}
+
+  canvas{
+    width:100%;height:110px;display:block;
+    background:var(--surface);margin-top:14px;
+  }
+  .caption{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim);margin-top:6px}
+
+  table{width:100%;border-collapse:collapse;margin-top:16px}
+  th,td{
+    text-align:left;padding:9px 8px;border-bottom:1px solid var(--line);
+    font-size:12px;
+  }
+  th{
+    font-size:10px;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--dim);font-weight:400;
+  }
+  td.v{text-align:right;font-variant-numeric:tabular-nums;font-weight:700}
+  td.n{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.08em}
+  tr.hi td.v{color:var(--red)}
+
+  .verdict{
+    border-left:3px solid var(--red);background:var(--surface);
+    padding:13px 14px;margin-top:18px;font-size:12px;line-height:1.6;
+  }
+  .verdict h2{
+    font-size:11px;letter-spacing:.16em;text-transform:uppercase;
+    color:var(--dim);font-weight:400;margin-bottom:7px;
+  }
+  .hide{display:none}
+  textarea{
+    width:100%;height:150px;background:var(--surface);color:var(--text);
+    border:1px solid var(--line);border-radius:0;font:inherit;font-size:11px;
+    padding:10px;margin-top:10px;resize:vertical;
+  }
+</style>
+</head>
+<body>
+
+<span class="accent"></span>
+<h1>Echelon · Link Probe</h1>
+<div class="sub" id="target">measuring transport to host</div>
+
+<div class="rule"></div>
+
+<p style="color:var(--dim);font-size:12px">
+  Sends a 30&nbsp;Hz packet stream over WebSocket for 60&nbsp;seconds — the same
+  rate and payload size the game server would use — then reports round-trip
+  time, jitter and stall behaviour. Keep this tab in the foreground.
+</p>
+
+<button id="go">Start 60-second test</button>
+
+<div class="status">
+  <span id="phase">idle</span>
+  <span><b id="count">0</b> samples</span>
+</div>
+<div class="bar"><i id="prog"></i></div>
+
+<canvas id="plot" width="640" height="220"></canvas>
+<div class="caption" id="plotcap">round-trip time over test duration</div>
+
+<div id="results" class="hide">
+  <table>
+    <tr><th>Metric</th><th style="text-align:right">Value</th></tr>
+    <tr><td class="n">Minimum RTT</td><td class="v" id="r-min">—</td></tr>
+    <tr><td class="n">Median (p50)</td><td class="v" id="r-p50">—</td></tr>
+    <tr><td class="n">p95</td><td class="v" id="r-p95">—</td></tr>
+    <tr><td class="n">p99</td><td class="v" id="r-p99">—</td></tr>
+    <tr><td class="n">Maximum</td><td class="v" id="r-max">—</td></tr>
+    <tr class="hi"><td class="n">Queue delay (p50 − min)</td><td class="v" id="r-que">—</td></tr>
+    <tr class="hi"><td class="n">Jitter (mean deviation)</td><td class="v" id="r-jit">—</td></tr>
+    <tr class="hi"><td class="n">Stalls (≥1 extra trip)</td><td class="v" id="r-spk">—</td></tr>
+    <tr><td class="n">Worst stall run</td><td class="v" id="r-run">—</td></tr>
+    <tr><td class="n">Packets returned</td><td class="v" id="r-ret">—</td></tr>
+  </table>
+
+  <div class="verdict" id="verdict"></div>
+
+  <button class="ghost" id="copy" style="margin-top:14px">Copy results to send back</button>
+  <textarea id="dump" readonly class="hide"></textarea>
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  const HZ = 30;                 // matches planned snapshot rate
+  const DURATION_MS = 60000;
+  const WARMUP = 20;             // discard: TLS + TCP slow start settling
+  const SNAP_MS = 1000 / HZ;
+
+  const $ = id => document.getElementById(id);
+  const wsUrl = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
+  $("target").textContent = "host · " + location.host;
+
+  const rtts = [];               // kept samples (post-warmup)
+  const sent = new Map();        // seq -> send time
+  let seq = 0, returned = 0, started = 0, ws = null, timer = null, done = false;
+
+  /* ---------- plot ---------- */
+  const cv = $("plot"), cx = cv.getContext("2d");
+  function draw() {
+    const W = cv.width, H = cv.height;
+    cx.clearRect(0, 0, W, H);
+    if (!rtts.length) return;
+    const max = Math.max(...rtts) * 1.12, min = Math.min(...rtts) * 0.9;
+    const span = Math.max(1, max - min);
+    const med = percentile(rtts, 50);
+
+    // median reference line
+    const my = H - ((med - min) / span) * H;
+    cx.strokeStyle = "rgba(243,242,242,0.22)";
+    cx.setLineDash([4, 4]); cx.lineWidth = 1;
+    cx.beginPath(); cx.moveTo(0, my); cx.lineTo(W, my); cx.stroke();
+    cx.setLineDash([]);
+
+    cx.strokeStyle = "#ff563c"; cx.lineWidth = 1.5;
+    cx.beginPath();
+    rtts.forEach((v, i) => {
+      const x = (i / Math.max(1, rtts.length - 1)) * W;
+      const y = H - ((v - min) / span) * H;
+      i ? cx.lineTo(x, y) : cx.moveTo(x, y);
+    });
+    cx.stroke();
+    $("plotcap").textContent =
+      `rtt ${Math.round(min)}–${Math.round(max)} ms · dashed = median ${Math.round(med)} ms`;
+  }
+
+  function percentile(arr, p) {
+    const s = [...arr].sort((a, b) => a - b);
+    return s[Math.min(s.length - 1, Math.floor((p / 100) * s.length))];
+  }
+
+  /* ---------- run ---------- */
+  $("go").onclick = () => {
+    $("go").disabled = true;
+    $("phase").textContent = "connecting";
+    ws = new WebSocket(wsUrl);
+    ws.onopen = () => {
+      $("phase").textContent = "measuring";
+      started = performance.now();
+      timer = setInterval(tick, SNAP_MS);
+    };
+    ws.onmessage = e => {
+      const [s, cSend] = e.data.split(",");
+      const now = performance.now();
+      const t0 = sent.get(Number(s));
+      if (t0 === undefined) return;
+      sent.delete(Number(s));
+      returned++;
+      if (returned > WARMUP) { rtts.push(now - t0); $("count").textContent = rtts.length; }
+      if (rtts.length % 15 === 0) draw();
+    };
+    ws.onerror = () => { $("phase").textContent = "connection failed"; $("go").disabled = false; };
+    ws.onclose = () => { if (!done) finish("connection dropped"); };
+  };
+
+  function tick() {
+    const elapsed = performance.now() - started;
+    $("prog").style.width = Math.min(100, (elapsed / DURATION_MS) * 100) + "%";
+    if (elapsed >= DURATION_MS) return finish("complete");
+    if (ws.readyState !== 1) return;
+    seq++;
+    sent.set(seq, performance.now());
+    ws.send(seq + "," + Date.now());
+  }
+
+  function finish(why) {
+    if (done) return;
+    done = true;
+    clearInterval(timer);
+    try { ws.close(); } catch {}
+    $("phase").textContent = why;
+    $("prog").style.width = "100%";
+    draw();
+    if (rtts.length < 30) {
+      $("phase").textContent = why + " · too few samples";
+      $("go").disabled = false;
+      return;
+    }
+    report();
+  }
+
+  function report() {
+    const min = Math.min(...rtts), max = Math.max(...rtts);
+    const p50 = percentile(rtts, 50), p95 = percentile(rtts, 95), p99 = percentile(rtts, 99);
+
+    // Mean consecutive deviation — the variance the interpolation buffer must absorb.
+    let acc = 0;
+    for (let i = 1; i < rtts.length; i++) acc += Math.abs(rtts[i] - rtts[i - 1]);
+    const jitter = acc / Math.max(1, rtts.length - 1);
+
+    /* Standing queue delay. The minimum is the only sample that reflects the
+       real path, so anything the median carries above it is time spent waiting
+       in a buffer rather than travelling. This separates "far away" (high min)
+       from "congested" (high p50 - min) — the two need completely different
+       responses, and a percentile table alone conflates them. */
+    const queue = p50 - min;
+
+    /* Over TCP there is no observable packet loss — the stack retransmits, so a
+       lost segment surfaces as a latency spike instead.
+       Threshold is median + min, i.e. at least one whole extra round trip above
+       the local baseline. An earlier version used 3x median, which goes blind
+       exactly when the median is inflated by queuing: the case that most needs
+       detecting. */
+    const thresh = p50 + min;
+    let spikes = 0, run = 0, worstRun = 0;
+    for (const v of rtts) {
+      if (v > thresh) { spikes++; run++; worstRun = Math.max(worstRun, run); }
+      else run = 0;
+    }
+
+    const buffer = Math.max(SNAP_MS, Math.ceil((p99 - p50) / 5) * 5);
+    const seen = Math.round(p50 / 2 + buffer);
+    const ms = v => Math.round(v) + " ms";
+
+    $("r-min").textContent = ms(min);
+    $("r-p50").textContent = ms(p50);
+    $("r-p95").textContent = ms(p95);
+    $("r-p99").textContent = ms(p99);
+    $("r-max").textContent = ms(max);
+    $("r-que").textContent = ms(queue);
+    $("r-jit").textContent = jitter.toFixed(1) + " ms";
+    $("r-spk").textContent = spikes + " / " + rtts.length +
+      " (" + (spikes / rtts.length * 100).toFixed(1) + "%)";
+    $("r-run").textContent = worstRun ? worstRun + " consecutive" : "none";
+    $("r-ret").textContent = returned + " / " + seq;
+
+    /* Congestion is diagnosed before distance: a link whose floor is fine but
+       whose median is not is a local problem, and reporting it as "high ping"
+       sends you optimising the wrong thing. */
+    const congested = queue > 60;
+    const grade =
+      congested ? "congested — the path is fine, the queue is not" :
+      jitter < 8 && spikes / rtts.length < 0.01 ? "stable — netcode can run a tight buffer" :
+      jitter < 20 && spikes / rtts.length < 0.03 ? "usable — buffer sized for the spread" :
+      "unstable — variance is the limiting factor here";
+
+    $("verdict").innerHTML =
+      "<h2>Assessment</h2>" +
+      "<b>" + grade + "</b><br><br>" +
+      (congested
+        ? "The best sample got through in <b>" + ms(min) + "</b>, so the route itself " +
+          "is sound. The median is <b>" + ms(queue) + "</b> slower than that, which is " +
+          "time spent waiting in a buffer rather than travelling — something on this " +
+          "connection or in the ISP's last mile is holding a queue. Worth re-testing " +
+          "off-peak, on a cable, with nothing else streaming: those numbers are the " +
+          "ones the game design should be based on.<br><br>"
+        : "") +
+      "Median round trip <b>" + ms(p50) + "</b>. Recommended interpolation buffer " +
+      "<b>" + ms(buffer) + "</b>, derived from the p99–p50 spread. Net effect: remote " +
+      "players render roughly <b>" + seen + " ms</b> in the past, while your own " +
+      "movement stays instant under client-side prediction." +
+      (spikes / rtts.length >= 0.02
+        ? "<br><br>Stall rate is high enough that WebSocket/TCP retransmission is " +
+          "a real cost — this is the case for WebRTC DataChannel over TCP."
+        : "<br><br>Stall rate is low enough that WebSocket/TCP is a sound choice; " +
+          "WebRTC would add complexity for little gain.");
+
+    $("results").classList.remove("hide");
+
+    const summary =
+      "ECHELON LINK PROBE\n" +
+      "host      " + location.host + "\n" +
+      "when      " + new Date().toISOString() + "\n" +
+      "agent     " + navigator.userAgent + "\n" +
+      "rate      " + HZ + " Hz, " + (DURATION_MS / 1000) + " s\n" +
+      "samples   " + rtts.length + " (returned " + returned + "/" + seq + ")\n" +
+      "----------------------------------------\n" +
+      "min       " + ms(min) + "\n" +
+      "p50       " + ms(p50) + "\n" +
+      "p95       " + ms(p95) + "\n" +
+      "p99       " + ms(p99) + "\n" +
+      "max       " + ms(max) + "\n" +
+      "queue     " + ms(queue) + " (p50 - min: buffering, not distance)\n" +
+      "jitter    " + jitter.toFixed(1) + " ms (mean consecutive deviation)\n" +
+      "stalls    " + spikes + " (" + (spikes / rtts.length * 100).toFixed(1) + "%), " +
+        "worst run " + worstRun + "\n" +
+      "----------------------------------------\n" +
+      "buffer    " + ms(buffer) + " recommended\n" +
+      "verdict   " + grade + "\n";
+
+    $("dump").value = summary;
+    $("copy").onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(summary);
+        $("copy").textContent = "Copied";
+      } catch {
+        $("dump").classList.remove("hide");
+        $("dump").select();
+        $("copy").textContent = "Select the text above and copy";
+      }
+    };
+  }
+})();
+</script>
+</body>
+</html>

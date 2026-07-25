@@ -9,3 +9,4 @@ android/capacitor-cordova-android-plugins/
 *.apk.idsig
 .DS_Store
 ECHELON-debug.apk
+.playwright-cli/
