@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">ECHELON</string>
+    <string name="title_activity_main">ECHELON</string>
+    <string name="package_name">gg.echelon.ravenglass</string>
+    <string name="custom_url_scheme">gg.echelon.ravenglass</string>
+</resources>

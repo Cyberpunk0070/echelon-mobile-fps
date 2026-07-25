@@ -1,0 +1,12 @@
+{
+  "appId": "gg.echelon.ravenglass",
+  "appName": "ECHELON",
+  "webDir": "www",
+  "android": {
+    "backgroundColor": "#151312",
+    "allowMixedContent": false
+  },
+  "server": {
+    "androidScheme": "https"
+  }
+}

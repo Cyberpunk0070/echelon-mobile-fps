@@ -89,6 +89,7 @@ export class Game {
     this.time = MATCH.timeLimit;
     this.score = [0, 0];
     this.last = performance.now();
+    this.fpsFrames = 0; this.fpsT = 0;
     window.__game = this; // debug/QA handle
     const loop = (now) => {
       if (this.disposed) return;
@@ -96,6 +97,12 @@ export class Game {
       const rawDt = (now - this.last) / 1000;
       this.last = now;
       const dt = Math.min(rawDt, 0.05);
+      // fps readout (status strip) — counts real rAF cadence, updates 2x/s
+      this.fpsFrames++; this.fpsT += rawDt;
+      if (this.fpsT >= 0.5) {
+        this.$("fps").textContent = Math.round(this.fpsFrames / this.fpsT) + " FPS";
+        this.fpsFrames = 0; this.fpsT = 0;
+      }
       if (!this.paused && !this.over) {
         this.update(dt);
         // adaptive resolution: if the phone can't hold frame time, step the
@@ -485,6 +492,9 @@ export class Game {
     this.look = { id: -1, lx: 0, ly: 0 };
     this.firing = false;
     this.pointerLocked = false;
+    this.ads = 0;          // 0 = hip, 1 = fully aimed
+    this.adsOn = false;
+    this.lookScale = 1;    // sensitivity follows fov while aiming
 
     const kd = e => {
       if (e.repeat) return;
@@ -501,15 +511,20 @@ export class Game {
       if (this.paused || this.over || !this.player.alive) return;
       if (!this.pointerLocked) { this.canvas.requestPointerLock?.(); return; }
       if (e.button === 0) this.firing = true;
+      if (e.button === 2) this.adsOn = true;   // desktop: hold right mouse to ADS
     });
-    this.bind(window, "mouseup", () => { this.firing = this.fireBtnHeld || false; });
+    this.bind(window, "mouseup", e => {
+      if (e.button === 2) this.adsOn = false;
+      this.firing = this.fireBtnHeld || false;
+    });
+    this.bind(this.canvas, "contextmenu", e => e.preventDefault());
     this.bind(document, "pointerlockchange", () => {
       this.pointerLocked = document.pointerLockElement === this.canvas;
     });
     this.bind(window, "mousemove", e => {
       if (!this.pointerLocked || this.paused) return;
-      this.player.yaw -= e.movementX * 0.0023;
-      this.player.pitch -= e.movementY * 0.0023;
+      this.player.yaw -= e.movementX * 0.0023 * this.lookScale;
+      this.player.pitch -= e.movementY * 0.0023 * this.lookScale;
       this.clampPitch();
     });
 
@@ -542,8 +557,8 @@ export class Game {
           this.stick.x = (dx * k) / cap;
           this.stick.y = (dy * k) / cap;
         } else if (t.identifier === this.look.id) {
-          this.player.yaw -= (t.clientX - this.look.lx) * 0.0052;
-          this.player.pitch -= (t.clientY - this.look.ly) * 0.0052;
+          this.player.yaw -= (t.clientX - this.look.lx) * 0.0052 * this.lookScale;
+          this.player.pitch -= (t.clientY - this.look.ly) * 0.0052 * this.lookScale;
           this.clampPitch();
           this.look.lx = t.clientX; this.look.ly = t.clientY;
         }
@@ -559,9 +574,21 @@ export class Game {
     this.bind(surface, "touchend", touchEnd);
     this.bind(surface, "touchcancel", touchEnd);
 
-    // buttons
+    // buttons — a touch that starts on FIRE also drives the look camera
+    // (CoD-style: track targets while holding fire)
     const fireBtn = this.$("btn-fire");
-    const fstart = e => { e.preventDefault(); this.sfx.ensure(); this.fireBtnHeld = true; this.firing = true; };
+    const fstart = e => {
+      e.preventDefault();
+      this.sfx.ensure();
+      this.fireBtnHeld = true;
+      this.firing = true;
+      if (e.changedTouches?.length && this.look.id === -1) {
+        const t = e.changedTouches[0];
+        this.look.id = t.identifier;
+        this.look.lx = t.clientX;
+        this.look.ly = t.clientY;
+      }
+    };
     const fend = e => { e.preventDefault(); this.fireBtnHeld = false; if (!this.pointerLocked) this.firing = false; };
     this.bind(fireBtn, "touchstart", fstart, { passive: false });
     this.bind(fireBtn, "touchend", fend, { passive: false });
@@ -572,6 +599,7 @@ export class Game {
     this.bind(fireBtn, "mouseup", fend);
     this.bind(this.$("btn-reload"), "click", () => this.startReload());
     this.bind(this.$("btn-vault"), "click", () => this.doVault());
+    this.bind(this.$("btn-ads"), "click", () => this.toggleAds());
 
     // mobile: tabbing away / locking the screen pauses the match
     this.bind(document, "visibilitychange", () => {
@@ -595,6 +623,11 @@ export class Game {
   /* ---------- HUD ---------- */
   setupHud() {
     this.$("ammo-gun").textContent = this.loadout.name;
+    this.$("scope-overlay").querySelector(".tag").textContent =
+      `${this.loadout.name.split(" ")[0]} · ${this.loadout.adsZoom.toFixed(1)}×`;
+    this.$("scope-overlay").style.display = "none";
+    this.$("btn-ads").classList.remove("on");
+    this.$("fps").textContent = "";
     this.mm = this.$("minimap").getContext("2d");
     // compass strip: repeated cardinal sequence
     const seq = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
@@ -680,6 +713,7 @@ export class Game {
     p.respawnT = 3.2;
     p.reloading = 0;
     p.vaultT = 0; p.vaultFrom = null; p.vaultTo = null; // no ghost-vault after respawn
+    this.adsOn = false; // hudSet syncs the button; ads lerps out via adsTarget
     this.$("reload-ring").style.display = "none";
     this.firing = false;
     this.score[1]++;
@@ -731,6 +765,11 @@ export class Game {
     this.setPrompt(`MAG SWAP · ${L.reloadTime.toFixed(1)}s`);
     this.$("reload-fill").style.width = "0%";
     this.$("reload-ring").style.display = "flex";
+  }
+
+  toggleAds() {
+    if (!this.player.alive || this.paused || this.over) return;
+    this.adsOn = !this.adsOn;
   }
 
   doVault() {
@@ -785,8 +824,11 @@ export class Game {
     this.vmKick = 1;
     this.moveLabel = "FIRING";
 
-    // spread grows with movement
-    const spread = (L.spreadDeg + (p.speedVal > 0.5 ? L.moveSpreadDeg : 0)) * Math.PI / 180;
+    // spread: hip vs ADS interpolated by aim progress, movement penalty fades while aimed
+    const aim = this.ads;
+    const spreadMult = L.hipSpreadMult + (L.adsSpreadMult - L.hipSpreadMult) * aim;
+    const moveP = p.speedVal > 0.5 ? L.moveSpreadDeg * (1 - 0.7 * aim) : 0;
+    const spread = (L.spreadDeg * spreadMult + moveP) * Math.PI / 180;
     const yawOff = (Math.random() - 0.5) * spread;
     const pitchOff = (Math.random() - 0.5) * spread;
     const yaw = p.yaw + yawOff, pitch = p.pitch + pitchOff;
@@ -866,6 +908,11 @@ export class Game {
       }
     }
 
+    // ---- ADS lerp: aiming drops while reloading or vaulting ----
+    const adsTarget = (this.adsOn && p.alive && p.reloading <= 0 && p.vaultT <= 0) ? 1 : 0;
+    const adsStep = dt / Math.max(0.05, L.adsTime);
+    this.ads += Math.sign(adsTarget - this.ads) * Math.min(Math.abs(adsTarget - this.ads), adsStep);
+
     // ---- player movement ----
     if (p.alive) {
       if (p.vaultT > 0) {
@@ -887,11 +934,13 @@ export class Game {
         const sin = Math.sin(p.yaw), cos = Math.cos(p.yaw);
         const wx = (-sin * -mz) + (cos * mx);
         const wz = (-cos * -mz) + (-sin * mx);
-        const speed = L.moveSpeed;
+        const speed = L.moveSpeed * (1 + (L.adsMoveMult - 1) * this.ads);
         this.moveEntity(p, wx * speed * dt, wz * speed * dt);
         p.speedVal = mlen * speed;
         if (p.reloading <= 0 && p.vaultT <= 0 && !this.firing && p.grounded) {
-          this.moveLabel = mlen > 0.05 ? (mlen > 0.75 ? "SPRINT" : "MOVE") : "HOLD";
+          this.moveLabel = this.ads > 0.6
+            ? (L.scope ? "SCOPED" : "ADS")
+            : mlen > 0.05 ? (mlen > 0.75 ? "SPRINT" : "MOVE") : "HOLD";
         }
 
         // gravity / ground
@@ -952,6 +1001,13 @@ export class Game {
     this.camera.rotation.order = "YXZ";
     this.camera.rotation.y = p.yaw;
     this.camera.rotation.x = p.pitch;
+    // ADS fov zoom; look sensitivity tracks the zoom so aiming feels stable
+    const fov = 74 / (1 + (L.adsZoom - 1) * this.ads);
+    if (Math.abs(this.camera.fov - fov) > 0.01) {
+      this.camera.fov = fov;
+      this.camera.updateProjectionMatrix();
+    }
+    this.lookScale = fov / 74;
     // viewmodel: reset to rest pose, then layer reload animation + recoil kick
     const vm = this.viewmodel;
     vm.rotation.set(0, 0, 0);
@@ -967,6 +1023,11 @@ export class Game {
     this.vmKick = Math.max(0, this.vmKick - dt * 9);
     vm.position.z += this.vmKick * 0.06;
     vm.rotation.x += this.vmKick * 0.05;
+    // ADS: bring the gun to center; fully-scoped sniper hides the viewmodel
+    vm.position.x = -0.26 * this.ads;
+    vm.position.y += 0.055 * this.ads;
+    vm.position.z += 0.1 * this.ads;
+    vm.visible = !(L.scope && this.ads > 0.9);
 
     this.updateHud(dt);
   }
@@ -990,6 +1051,18 @@ export class Game {
       this.$("joy-knob").style.transform =
         `translate(calc(-50% + ${Math.round(this.stick.x * 30)}px), calc(-50% + ${Math.round(this.stick.y * 30)}px))`;
     });
+
+    // ADS visuals: crosshair tightens (hides behind a scope), overlay at full zoom
+    const L = this.loadout;
+    this.hudSet("ch", Math.round(this.ads * 24), () => {
+      const ch = this.$("crosshair");
+      ch.style.opacity = (L.scope && this.ads > 0.6) ? 0 : 1;
+      ch.style.transform = `translate(-50%,-50%) scale(${(1 - 0.4 * this.ads).toFixed(3)})`;
+    });
+    this.hudSet("scope", L.scope && this.ads > 0.92,
+      v => { this.$("scope-overlay").style.display = v ? "block" : "none"; });
+    this.hudSet("adsBtn", this.adsOn,
+      v => this.$("btn-ads").classList.toggle("on", v));
 
     // compass: strip spans are 55px per 45°
     const yawDeg = ((-this.player.yaw * 180 / Math.PI) % 360 + 360) % 360;

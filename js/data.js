@@ -65,6 +65,13 @@ export const WEAPONS = [
     name: "LR-13 OBELISK", cls: "MARKSMAN RIFLE", lvl: 12, origin: "7.62×51 · 220 RPM",
     note: "Two-shot chest kill at any range. Heavy ADS penalty; the skeleton stock is not optional.",
     base: [92, 96, 34, 44, 36, 24], rpm: 220, mag: 12, reserve: 48, reload: 2.2, auto: false,
+    zoom: 2.4,
+  },
+  {
+    name: "AM-50 BASILISK", cls: "SNIPER RIFLE", lvl: 55, origin: ".50 BMG · 45 RPM",
+    note: "One shot, one kill to center mass — through the scope. Hip fire is a prayer; commit to the glass.",
+    base: [100, 100, 18, 30, 22, 6], rpm: 45, mag: 5, reserve: 25, reload: 3.2, auto: false,
+    zoom: 5.0, scope: true, dmgScale: 1.0,
   },
 ];
 
@@ -97,10 +104,11 @@ export function buildLoadout(weaponIdx, atts) {
   let mag = w.mag, reload = w.reload;
   if (atts[4] === 1) mag = Math.round(w.mag * 1.5);       // 45 RD
   if (atts[4] === 2) reload = Math.max(0.9, w.reload - 0.6); // FAST MAG
+  const scope = !!w.scope;
   return {
     weaponIdx, atts: atts.slice(),
     name: w.name, cls: w.cls, auto: w.auto,
-    damage: 10 + dmg * 0.45,                    // DMR ~51 = 2-shot, AR ~38 = 3-shot
+    damage: 10 + dmg * (w.dmgScale ?? 0.45),    // sniper one-shots, DMR 2-shots, AR 3-shots
     headshotMult: 1.5,
     rpm: w.rpm * (1 + (fr - w.base[5]) / 220),
     falloffStart: 10 + rng * 0.32,              // meters, then linear decay
@@ -111,6 +119,13 @@ export function buildLoadout(weaponIdx, atts) {
     moveSpeed: 4.0 + mob * 0.022,
     mag, reserve: w.reserve, reloadTime: reload,
     stats: st,
+    // --- ADS (aim down sights) model ---
+    adsZoom: w.zoom ?? 1.35,                    // fov divisor at full ADS
+    scope,                                      // full scope overlay at max zoom
+    adsTime: scope ? 0.34 : 0.16 + (100 - hnd) * 0.0016, // seconds to full ADS
+    adsSpreadMult: scope ? 0.02 : 0.22,         // spread while aimed
+    hipSpreadMult: scope ? 4.5 : 1,             // sniper hip fire is a prayer
+    adsMoveMult: scope ? 0.38 : 0.55,           // move slower while aimed
   };
 }
 
