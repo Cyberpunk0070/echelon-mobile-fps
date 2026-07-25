@@ -1,129 +1,22 @@
-// ECHELON — game runtime: dockyard arena, player controller, combat, HUD.
+// ECHELON — client runtime: rendering, input, HUD, audio.
+//
+// All simulation lives in js/sim/ and is shared verbatim with the server. This
+// file owns nothing authoritative: it collects input into a command, steps the
+// sim on a fixed timestep, and draws whatever came out. Everything here is
+// presentation, which is why none of it needs to exist on the Pi.
 import * as THREE from "three";
-import { Bot } from "./bots.js";
-import { SQUAD_ALLY, SQUAD_ENEMY, MATCH } from "./data.js";
+import { Sim, FIXED_DT, makeInput } from "./sim/index.js";
+import { ARENA, SPRINT_OUT } from "./sim/world.js";
+import { timeSinceHurt } from "./sim/player.js";
+import { MATCH } from "./data.js";
 
 const DARK = { bg: 0x151312, surface: 0x211f1e, text: 0xf3f2f2, red: 0xff563c };
-const ARENA = 47;              // half-extent of playable area
-const GRAVITY = 16;
-const EYE = 1.55;
-const EYE_CROUCH = 1.02;
-const SPRINT_MULT = 1.5;
-const CROUCH_MULT = 0.52;
-const SPRINT_OUT = 0.18;   // seconds from dropping sprint to first shot
+
+// Beyond this many sim steps in one frame, drop the backlog rather than trying
+// to catch up — chasing it makes the next frame later still (the spiral).
+const MAX_STEPS = 5;
 
 const _a = new THREE.Vector3(), _b = new THREE.Vector3();
-
-/* ---------------- broadphase ----------------
-   Uniform spatial hash over the static world AABBs. Queries that used to scan
-   every box now touch only the cells they overlap, and rays walk the grid with
-   a 2D DDA (the standard voxel-traversal approach) instead of testing all of
-   them. Cell size is tuned to the container footprint. */
-const GRID_CELL = 6;
-
-class SpatialHash {
-  constructor(boxes, cell = GRID_CELL) {
-    this.cell = cell;
-    this.boxes = boxes;
-    this.map = new Map();
-    this.stamp = new Int32Array(boxes.length);
-    this.tick = 0;
-    for (let i = 0; i < boxes.length; i++) {
-      const b = boxes[i];
-      const x0 = Math.floor(b.minX / cell), x1 = Math.floor(b.maxX / cell);
-      const z0 = Math.floor(b.minZ / cell), z1 = Math.floor(b.maxZ / cell);
-      for (let x = x0; x <= x1; x++) {
-        for (let z = z0; z <= z1; z++) {
-          const k = x * 73856093 ^ z * 19349663;
-          let arr = this.map.get(k);
-          if (!arr) { arr = []; this.map.set(k, arr); }
-          arr.push(i);
-        }
-      }
-    }
-  }
-
-  cellAt(x, z) { return this.map.get(x * 73856093 ^ z * 19349663); }
-
-  // indices of boxes whose cells overlap the XZ rect, deduped via a stamp
-  query(minX, maxX, minZ, maxZ, out) {
-    out.length = 0;
-    const c = this.cell;
-    const t = ++this.tick;
-    const x0 = Math.floor(minX / c), x1 = Math.floor(maxX / c);
-    const z0 = Math.floor(minZ / c), z1 = Math.floor(maxZ / c);
-    for (let x = x0; x <= x1; x++) {
-      for (let z = z0; z <= z1; z++) {
-        const arr = this.cellAt(x, z);
-        if (!arr) continue;
-        for (let i = 0; i < arr.length; i++) {
-          const bi = arr[i];
-          if (this.stamp[bi] === t) continue;
-          this.stamp[bi] = t;
-          out.push(bi);
-        }
-      }
-    }
-    return out;
-  }
-}
-
-// Ray vs AABB, slab method. Returns entry distance or Infinity.
-function slabHit(b, ox, oy, oz, dx, dy, dz, maxDist) {
-  let tmin = 0, tmax = maxDist;
-  if (Math.abs(dx) < 1e-9) { if (ox < b.minX || ox > b.maxX) return Infinity; }
-  else {
-    let t1 = (b.minX - ox) / dx, t2 = (b.maxX - ox) / dx;
-    if (t1 > t2) { const s = t1; t1 = t2; t2 = s; }
-    if (t1 > tmin) tmin = t1;
-    if (t2 < tmax) tmax = t2;
-    if (tmin > tmax) return Infinity;
-  }
-  if (Math.abs(dy) < 1e-9) { if (oy < b.y0 || oy > b.top) return Infinity; }
-  else {
-    let t1 = (b.y0 - oy) / dy, t2 = (b.top - oy) / dy;
-    if (t1 > t2) { const s = t1; t1 = t2; t2 = s; }
-    if (t1 > tmin) tmin = t1;
-    if (t2 < tmax) tmax = t2;
-    if (tmin > tmax) return Infinity;
-  }
-  if (Math.abs(dz) < 1e-9) { if (oz < b.minZ || oz > b.maxZ) return Infinity; }
-  else {
-    let t1 = (b.minZ - oz) / dz, t2 = (b.maxZ - oz) / dz;
-    if (t1 > t2) { const s = t1; t1 = t2; t2 = s; }
-    if (t1 > tmin) tmin = t1;
-    if (t2 < tmax) tmax = t2;
-    if (tmin > tmax) return Infinity;
-  }
-  return tmin;
-}
-
-/* Segmented hitboxes in the bot's local frame (facing -z, origin at feet),
-   the standard FPS model: a head worth a one-shot multiplier, a torso, and
-   lower-value legs. Replaces the old single cylinder + height threshold. */
-const HITBOXES = [
-  { name: "HEAD", cx: 0, cy: 1.68, cz: 0, hx: 0.17, hy: 0.17, hz: 0.17, mult: 2.0 },
-  { name: "CHEST", cx: 0, cy: 1.22, cz: 0, hx: 0.33, hy: 0.30, hz: 0.22, mult: 1.0 },
-  { name: "ABDOMEN", cx: 0, cy: 0.80, cz: 0, hx: 0.30, hy: 0.22, hz: 0.20, mult: 0.9 },
-  { name: "LEGS", cx: 0, cy: 0.36, cz: 0, hx: 0.28, hy: 0.36, hz: 0.19, mult: 0.75 },
-];
-
-// Ray vs a local-space box (half extents), slab method.
-function localSlabHit(h, ox, oy, oz, dx, dy, dz, maxDist) {
-  let tmin = 0, tmax = maxDist;
-  const lo = [h.cx - h.hx, h.cy - h.hy, h.cz - h.hz];
-  const hi = [h.cx + h.hx, h.cy + h.hy, h.cz + h.hz];
-  const o = [ox, oy, oz], d = [dx, dy, dz];
-  for (let i = 0; i < 3; i++) {
-    if (Math.abs(d[i]) < 1e-9) { if (o[i] < lo[i] || o[i] > hi[i]) return Infinity; continue; }
-    let t1 = (lo[i] - o[i]) / d[i], t2 = (hi[i] - o[i]) / d[i];
-    if (t1 > t2) { const s = t1; t1 = t2; t2 = s; }
-    if (t1 > tmin) tmin = t1;
-    if (t2 < tmax) tmax = t2;
-    if (tmin > tmax) return Infinity;
-  }
-  return tmin;
-}
 
 /* ---------------- audio ---------------- */
 class Sfx {
@@ -185,10 +78,9 @@ export class Game {
     this.over = false;
     this.disposed = false;
     this.raf = 0;
-    this.boxes = [];       // {minX,maxX,y0,top,minZ,maxZ}
-    this.boxSpecs = [];    // draw specs, batched into InstancedMeshes at map end
+    this.accum = 0;
     this.tracers = [];
-    this.feedTimers = [];
+    this.botMeshes = new Map();   // bot id -> THREE.Group (render state, not sim state)
     this._bound = [];
     this.$ = id => document.getElementById(id);
   }
@@ -196,57 +88,54 @@ export class Game {
   /* ---------- setup ---------- */
   start() {
     this.setupScene();
-    this.buildMap();
-    this.setupPlayer();
-    this.setupBots();
+
+    // The simulation. Map seed is fixed so the dockyard is the designed one;
+    // the match seed varies so bot rosters and spawns differ between rounds.
+    this.sim = new Sim({ seed: 1337, matchSeed: (Math.random() * 0x7fffffff) | 0 });
+    this.player = this.sim.addPlayer({ name: "VIPER-04", team: 0, loadout: this.loadout });
+    this.sim.fillBots(6);
+
+    this.buildStaticMeshes(this.sim.world.specs);
+    this.buildGround();
+    this.setupBotMeshes();
     this.setupViewmodel();
     this.setupInput();
     this.setupHud();
-    this.time = MATCH.timeLimit;
-    this.score = [0, 0];
+
     this.last = performance.now();
     this.fpsFrames = 0; this.fpsT = 0;
-    this.pushTimer = 20;
     window.__game = this; // debug/QA handle
+
     const loop = (now) => {
       if (this.disposed) return;
       this.raf = requestAnimationFrame(loop);
       const rawDt = (now - this.last) / 1000;
       this.last = now;
-      const dt = Math.min(rawDt, 0.05);
+
       // fps readout (status strip) — counts real rAF cadence, updates 2x/s
       this.fpsFrames++; this.fpsT += rawDt;
       if (this.fpsT >= 0.5) {
         this.$("fps").textContent = Math.round(this.fpsFrames / this.fpsT) + " FPS";
         this.fpsFrames = 0; this.fpsT = 0;
       }
-      if (!this.paused && !this.over) {
-        this.update(dt);
-        // adaptive resolution: if the phone can't hold frame time, step the
-        // pixel ratio down (and back up when there's headroom)
-        this.perfAccum += rawDt; this.perfFrames++;
-        // 0.004 guard: ignore implausible sub-4ms deltas (rAF never
-        // legitimately paces above 250 Hz)
-        if (rawDt >= 0.004) {
-          if (rawDt < this.perfMin1) { this.perfMin2 = this.perfMin1; this.perfMin1 = rawDt; }
-          else if (rawDt < this.perfMin2) { this.perfMin2 = rawDt; }
+
+      const running = !this.paused && !this.over;
+      if (running) {
+        /* Fixed timestep. The sim previously advanced by whatever rAF delta
+           arrived, which made the physics frame-rate dependent and impossible
+           to replay — both fatal for prediction and reconciliation. */
+        this.syncInput();
+        this.accum += Math.min(rawDt, 0.25);
+        let steps = 0;
+        while (this.accum >= FIXED_DT && steps < MAX_STEPS) {
+          this.stepSim(FIXED_DT);
+          this.accum -= FIXED_DT;
+          steps++;
         }
-        if (this.perfFrames >= 120) {
-          const avg = this.perfAccum / this.perfFrames;
-          const floor = this.perfMin2 === Infinity ? 0.0167 : this.perfMin2;
-          this.perfAccum = 0; this.perfFrames = 0;
-          this.perfMin1 = Infinity; this.perfMin2 = Infinity;
-          const scales = [1, 0.8, 0.65];
-          // missing >~40% of vsyncs -> downscale; comfortably hitting them -> restore
-          if (avg > floor * 1.7 && this.perfLevel < 2) this.perfLevel++;
-          else if (avg < floor * 1.25 && this.perfLevel > 0) this.perfLevel--;
-          const target = this.basePixelRatio * scales[this.perfLevel];
-          if (Math.abs(this.renderer.getPixelRatio() - target) > 0.01) {
-            this.renderer.setPixelRatio(target);
-            this.resize();
-          }
-        }
+        if (steps === MAX_STEPS) this.accum = 0;
+        this.adaptResolution(rawDt);
       }
+      this.present(running ? rawDt : 0);
       this.renderer.render(this.scene, this.camera);
     };
     this.raf = requestAnimationFrame(loop);
@@ -307,44 +196,36 @@ export class Game {
     return m;
   }
 
-  // Records a world box: an AABB for collision plus a draw spec. Nothing is
-  // added to the scene here — buildStaticMeshes() batches the specs into one
-  // InstancedMesh per color, which is what keeps the draw-call count flat.
-  addBox(cx, cz, w, d, h, color, y0 = 0, stripe = null) {
-    this.boxSpecs.push({ x: cx, y: y0 + h / 2, z: cz, w, h, d, color });
-    if (stripe) {
-      this.boxSpecs.push({
-        x: cx, y: y0 + h * 0.62, z: cz,
-        w: w + 0.04, h: h * 0.18, d: d + 0.04, color: stripe,
-      });
+  // adaptive resolution: if the phone can't hold frame time, step the pixel
+  // ratio down (and back up when there's headroom)
+  adaptResolution(rawDt) {
+    this.perfAccum += rawDt; this.perfFrames++;
+    // 0.004 guard: ignore implausible sub-4ms deltas (rAF never legitimately
+    // paces above 250 Hz)
+    if (rawDt >= 0.004) {
+      if (rawDt < this.perfMin1) { this.perfMin2 = this.perfMin1; this.perfMin1 = rawDt; }
+      else if (rawDt < this.perfMin2) { this.perfMin2 = rawDt; }
     }
-    this.boxes.push({ minX: cx - w / 2, maxX: cx + w / 2, minZ: cz - d / 2, maxZ: cz + d / 2, y0, top: y0 + h });
+    if (this.perfFrames < 120) return;
+    const avg = this.perfAccum / this.perfFrames;
+    const floor = this.perfMin2 === Infinity ? 0.0167 : this.perfMin2;
+    this.perfAccum = 0; this.perfFrames = 0;
+    this.perfMin1 = Infinity; this.perfMin2 = Infinity;
+    const scales = [1, 0.8, 0.65];
+    // missing >~40% of vsyncs -> downscale; comfortably hitting them -> restore
+    if (avg > floor * 1.7 && this.perfLevel < 2) this.perfLevel++;
+    else if (avg < floor * 1.25 && this.perfLevel > 0) this.perfLevel--;
+    const target = this.basePixelRatio * scales[this.perfLevel];
+    if (Math.abs(this.renderer.getPixelRatio() - target) > 0.01) {
+      this.renderer.setPixelRatio(target);
+      this.resize();
+    }
   }
 
-  buildStaticMeshes() {
-    const byColor = new Map();
-    for (const s of this.boxSpecs) {
-      let list = byColor.get(s.color);
-      if (!list) { list = []; byColor.set(s.color, list); }
-      list.push(s);
-    }
-    const m4 = new THREE.Matrix4();
-    for (const [color, list] of byColor) {
-      const im = new THREE.InstancedMesh(this.geoCache, this.mat(color), list.length);
-      list.forEach((s, i) => {
-        m4.makeScale(s.w, s.h, s.d);
-        m4.setPosition(s.x, s.y, s.z);
-        im.setMatrixAt(i, m4);
-      });
-      im.instanceMatrix.needsUpdate = true;
-      im.frustumCulled = false; // instance bounds span the arena; culling can't help
-      this.scene.add(im);
-    }
-    this.boxSpecs = null;
-  }
-
-  buildMap() {
-    // ground: dark slab with a modernist grid texture
+  /* ---------- world rendering ----------
+     The sim hands over draw specs generated by the same addBox calls that made
+     the collision AABBs, so geometry and collision cannot disagree. */
+  buildGround() {
     const gc = document.createElement("canvas");
     gc.width = gc.height = 512;
     const g2 = gc.getContext("2d");
@@ -365,223 +246,32 @@ export class Game {
     );
     ground.rotation.x = -Math.PI / 2;
     this.scene.add(ground);
+  }
 
-    // perimeter walls
-    const W = ARENA + 1;
-    this.addBox(0, -W - 1.5, W * 2 + 8, 3, 7, 0x322e2c);
-    this.addBox(0, W + 1.5, W * 2 + 8, 3, 7, 0x322e2c);
-    this.addBox(-W - 1.5, 0, 3, W * 2 + 8, 7, 0x322e2c);
-    this.addBox(W + 1.5, 0, 3, W * 2 + 8, 7, 0x322e2c);
-
-    // shipping containers — deterministic dockyard rows
-    const grays = [0x3a3634, 0x474241, 0x555050, 0x625d5b];
-    let seed = 1337;
-    const rnd = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647; };
-    const rows = [-30, -18, -6, 6, 18, 30];
-    for (const rz of rows) {
-      let x = -38;
-      while (x < 38) {
-        if (rnd() < 0.68) {
-          const len = 7 + Math.floor(rnd() * 3) * 2;
-          const col = grays[Math.floor(rnd() * grays.length)];
-          const stripe = rnd() < 0.18 ? DARK.red : null;
-          const zj = (rnd() - 0.5) * 3;
-          this.addBox(x + len / 2, rz + zj, len, 2.6, 2.6, col, 0, stripe);
-          if (rnd() < 0.3) {
-            const l2 = Math.max(5, len - 2);
-            this.addBox(x + len / 2 + (rnd() - 0.5) * 2, rz + zj, l2, 2.6, 2.6, grays[Math.floor(rnd() * grays.length)], 2.6);
-          }
-          x += len + 2.5 + rnd() * 5;
-        } else {
-          x += 5 + rnd() * 6;
-        }
-      }
+  // One InstancedMesh per colour, which is what keeps the draw-call count flat.
+  buildStaticMeshes(specs) {
+    const byColor = new Map();
+    for (const s of specs) {
+      let list = byColor.get(s.color);
+      if (!list) { list = []; byColor.set(s.color, list); }
+      list.push(s);
     }
-    // scattered crates (vault targets)
-    for (let i = 0; i < 26; i++) {
-      const x = (rnd() * 2 - 1) * 40, z = (rnd() * 2 - 1) * 40;
-      let clash = false;
-      for (const b of this.boxes) {
-        if (x > b.minX - 2 && x < b.maxX + 2 && z > b.minZ - 2 && z < b.maxZ + 2 && b.y0 === 0) { clash = true; break; }
-      }
-      if (clash) continue;
-      this.addBox(x, z, 1.9, 1.9, 1.25, grays[Math.floor(rnd() * grays.length)]);
+    const m4 = new THREE.Matrix4();
+    for (const [color, list] of byColor) {
+      const im = new THREE.InstancedMesh(this.geoCache, this.mat(color), list.length);
+      list.forEach((s, i) => {
+        m4.makeScale(s.w, s.h, s.d);
+        m4.setPosition(s.x, s.y, s.z);
+        im.setMatrixAt(i, m4);
+      });
+      im.instanceMatrix.needsUpdate = true;
+      im.frustumCulled = false; // instance bounds span the arena; culling can't help
+      this.scene.add(im);
     }
-    // central landmark: red monolith block (the "one red field")
-    this.addBox(0, 0, 3.5, 3.5, 6.5, DARK.red);
-
-    this.buildStaticMeshes();
-    this.grid = new SpatialHash(this.boxes);
-    this._q = [];   // scratch list reused by every broadphase query
   }
 
-  /* ---------- collision & rays ---------- */
-  collides(x, z, r, feet, head) {
-    if (Math.abs(x) > ARENA || Math.abs(z) > ARENA) return true;
-    const hits = this.grid.query(x - r, x + r, z - r, z + r, this._q);
-    for (let i = 0; i < hits.length; i++) {
-      const b = this.boxes[hits[i]];
-      if (b.top <= feet + 0.55 || b.y0 >= head) continue; // can step on / walk under
-      if (x + r > b.minX && x - r < b.maxX && z + r > b.minZ && z - r < b.maxZ) return true;
-    }
-    return false;
-  }
-
-  moveEntity(e, dx, dz) {
-    const feet = e.pos.y, head = e.pos.y + (e.height || 1.8);
-    const r = e.radius || 0.45;
-    if (!this.collides(e.pos.x + dx, e.pos.z, r, feet, head)) e.pos.x += dx;
-    if (!this.collides(e.pos.x, e.pos.z + dz, r, feet, head)) e.pos.z += dz;
-  }
-
-  groundHeight(x, z, r, feet) {
-    let g = 0;
-    const hits = this.grid.query(x - r, x + r, z - r, z + r, this._q);
-    for (let i = 0; i < hits.length; i++) {
-      const b = this.boxes[hits[i]];
-      if (x + r > b.minX && x - r < b.maxX && z + r > b.minZ && z - r < b.maxZ) {
-        if (b.top <= feet + 0.55 && b.top > g) g = b.top;
-      }
-    }
-    return g;
-  }
-
-  // Nearest world hit along the ray, via 2D DDA over the spatial hash: only
-  // the grid columns the ray actually crosses are tested, and traversal stops
-  // as soon as the closest hit precedes the next cell boundary.
-  rayWorldDist(ox, oy, oz, dx, dy, dz, maxDist) {
-    let best = Infinity;
-    if (dy < -1e-9) {                       // ground plane
-      const tg = -oy / dy;
-      if (tg > 0 && tg < best) best = tg;
-    }
-    const c = this.grid.cell;
-    let cx = Math.floor(ox / c), cz = Math.floor(oz / c);
-    const stepX = dx > 1e-9 ? 1 : dx < -1e-9 ? -1 : 0;
-    const stepZ = dz > 1e-9 ? 1 : dz < -1e-9 ? -1 : 0;
-    const tDeltaX = stepX ? Math.abs(c / dx) : Infinity;
-    const tDeltaZ = stepZ ? Math.abs(c / dz) : Infinity;
-    let tMaxX = stepX ? ((stepX > 0 ? (cx + 1) * c : cx * c) - ox) / dx : Infinity;
-    let tMaxZ = stepZ ? ((stepZ > 0 ? (cz + 1) * c : cz * c) - oz) / dz : Infinity;
-
-    const tick = ++this.grid.tick;
-    const stamp = this.grid.stamp;
-    let t = 0;
-    for (let guard = 0; guard < 512; guard++) {
-      const arr = this.grid.cellAt(cx, cz);
-      if (arr) {
-        for (let i = 0; i < arr.length; i++) {
-          const bi = arr[i];
-          if (stamp[bi] === tick) continue;
-          stamp[bi] = tick;
-          const h = slabHit(this.boxes[bi], ox, oy, oz, dx, dy, dz, maxDist);
-          if (h < best) best = h;
-        }
-      }
-      if (!stepX && !stepZ) break;
-      const nextT = Math.min(tMaxX, tMaxZ);
-      if (nextT > maxDist || best <= nextT) break;  // nothing closer can exist
-      if (tMaxX < tMaxZ) { t = tMaxX; cx += stepX; tMaxX += tDeltaX; }
-      else { t = tMaxZ; cz += stepZ; tMaxZ += tDeltaZ; }
-      if (t > maxDist) break;
-    }
-    return best;
-  }
-
-  // Nearest enemy hitbox along the ray. Transforms the ray into each bot's
-  // local frame and slab-tests the segmented boxes, so a headshot is an actual
-  // head intersection rather than a height comparison.
-  raycastBots(ox, oy, oz, dx, dy, dz, maxT) {
-    let bestT = maxT, bestBot = null, bestPart = null;
-    for (const b of this.bots) {
-      if (!b.alive || b.team === 0) continue;
-      // cheap reject: skip bots whose bounding sphere the ray misses
-      const rx = b.pos.x - ox, ry = (b.pos.y + 0.9) - oy, rz = b.pos.z - oz;
-      const along = rx * dx + ry * dy + rz * dz;
-      if (along < -1.2 || along > bestT + 1.2) continue;
-      const perp2 = (rx * rx + ry * ry + rz * rz) - along * along;
-      if (perp2 > 1.44) continue;                        // 1.2 m radius
-      const c = Math.cos(b.yaw), s = Math.sin(b.yaw);
-      const px = ox - b.pos.x, pz = oz - b.pos.z;
-      const lx = px * c - pz * s, lz = px * s + pz * c;
-      const ly = oy - b.pos.y;
-      const ldx = dx * c - dz * s, ldz = dx * s + dz * c;
-      for (const h of HITBOXES) {
-        const t = localSlabHit(h, lx, ly, lz, ldx, dy, ldz, bestT);
-        if (t < bestT) { bestT = t; bestBot = b; bestPart = h; }
-      }
-    }
-    return bestBot ? { bot: bestBot, t: bestT, part: bestPart } : null;
-  }
-
-  losBlocked(x1, y1, z1, x2, y2, z2) {
-    const dx = x2 - x1, dy = y2 - y1, dz = z2 - z1;
-    const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
-    if (len < 1e-6) return false;
-    const t = this.rayWorldDist(x1, y1, z1, dx / len, dy / len, dz / len, len);
-    return t < len - 0.1;
-  }
-
-  spawnFor(team) {
-    const bx = team === 0 ? -40 : 40;
-    for (let i = 0; i < 24; i++) {
-      const x = bx + (Math.random() - 0.5) * 8;
-      const z = (Math.random() - 0.5) * 44;
-      if (!this.collides(x, z, 0.5, 0, 1.8)) return new THREE.Vector3(x, 0, z);
-    }
-    return new THREE.Vector3(bx, 0, 0);
-  }
-
-  randomNavPoint() {
-    for (let i = 0; i < 12; i++) {
-      const x = (Math.random() * 2 - 1) * (ARENA - 4);
-      const z = (Math.random() * 2 - 1) * (ARENA - 4);
-      if (!this.collides(x, z, 0.5, 0, 1.8)) return new THREE.Vector3(x, 0, z);
-    }
-    return new THREE.Vector3(0, 0, 20);
-  }
-
-  /* ---------- player ---------- */
-  setupPlayer() {
-    const L = this.loadout;
-    this.player = {
-      isPlayer: true, name: "VIPER-04", team: 0,
-      pos: this.spawnFor(0), yaw: 0, pitch: 0,
-      vy: 0, grounded: true,
-      alive: true, hp: 100, radius: 0.4, height: 1.8,
-      speedVal: 0, kills: 0, deaths: 0,
-      ammo: L.mag, reserve: L.reserve,
-      reloading: 0, shotT: 0, lastHurt: -10,
-      respawnT: 0, vaultT: 0, vaultFrom: null, vaultTo: null,
-      eyeH: EYE, sprintOutT: 0,
-    };
-    this.sprinting = false;
-    this.crouching = false;
-    // face the arena center (forward is (-sin yaw, -cos yaw))
-    this.player.yaw = Math.atan2(this.player.pos.x, this.player.pos.z);
-  }
-
-  setupBots() {
-    this.bots = [];
-    for (let i = 1; i < SQUAD_ALLY.length; i++) this.bots.push(new Bot(SQUAD_ALLY[i], 0));
-    for (const n of SQUAD_ENEMY) this.bots.push(new Bot(n, 1));
-    for (const b of this.bots) b.mesh = this.makeBotMesh(b.team);
-    this.combatants = [this.player, ...this.bots];
-    this.botCtx = {
-      combatants: this.combatants,
-      escalation: 0,   // 0 -> 1 across the match; drives bot speed/accuracy
-      world: {
-        losBlocked: (...a) => this.losBlocked(...a),
-        moveEntity: (e, dx, dz) => this.moveEntity(e, dx, dz),
-        spawnFor: t => this.spawnFor(t),
-        randomNavPoint: () => this.randomNavPoint(),
-      },
-      events: {
-        onBotShot: (bot, target, hit, dmg) => this.handleBotShot(bot, target, hit, dmg),
-        onDeath: (bot, killer) => this.handleDeath(bot, killer),
-        onRespawn: (bot) => { bot.mesh.visible = true; },
-      },
-    };
+  setupBotMeshes() {
+    for (const b of this.sim.bots) this.botMeshes.set(b.id, this.makeBotMesh(b.team));
   }
 
   makeBotMesh(team) {
@@ -652,6 +342,32 @@ export class Game {
     this.tracers = [];
   }
 
+  spawnTracer(from, to) {
+    if (this.tracers.length >= this.tracerMax) this.tracers.shift();
+    this.tracers.push({
+      ax: from.x, ay: from.y, az: from.z,
+      bx: to.x, by: to.y, bz: to.z, t: 0.06,
+    });
+  }
+
+  updateTracers(dt) {
+    const arr = this.tracers, pos = this.tracerPos;
+    let n = 0;
+    for (let i = 0; i < arr.length; i++) {
+      const tr = arr[i];
+      tr.t -= dt;
+      if (tr.t <= 0) continue;
+      arr[n] = tr;                       // compact survivors toward the front
+      const o = n * 6;
+      pos[o] = tr.ax; pos[o + 1] = tr.ay; pos[o + 2] = tr.az;
+      pos[o + 3] = tr.bx; pos[o + 4] = tr.by; pos[o + 5] = tr.bz;
+      n++;
+    }
+    arr.length = n;
+    this.tracerMesh.geometry.setDrawRange(0, n * 2);
+    this.tracerMesh.geometry.attributes.position.needsUpdate = true;
+  }
+
   // Staged reload: tilt in → mag drops out → grab pause → new mag seats →
   // charging-handle rack, all scaled to the loadout's real reload time.
   animateReload(t) {
@@ -691,33 +407,10 @@ export class Game {
     this.$("reload-cuff").style.width = pctText;   // progress on the button itself
   }
 
-  spawnTracer(from, to) {
-    if (this.tracers.length >= this.tracerMax) this.tracers.shift();
-    this.tracers.push({
-      ax: from.x, ay: from.y, az: from.z,
-      bx: to.x, by: to.y, bz: to.z, t: 0.06,
-    });
-  }
-
-  updateTracers(dt) {
-    const arr = this.tracers, pos = this.tracerPos;
-    let n = 0;
-    for (let i = 0; i < arr.length; i++) {
-      const tr = arr[i];
-      tr.t -= dt;
-      if (tr.t <= 0) continue;
-      arr[n] = tr;                       // compact survivors toward the front
-      const o = n * 6;
-      pos[o] = tr.ax; pos[o + 1] = tr.ay; pos[o + 2] = tr.az;
-      pos[o + 3] = tr.bx; pos[o + 4] = tr.by; pos[o + 5] = tr.bz;
-      n++;
-    }
-    arr.length = n;
-    this.tracerMesh.geometry.setDrawRange(0, n * 2);
-    this.tracerMesh.geometry.attributes.position.needsUpdate = true;
-  }
-
-  /* ---------- input ---------- */
+  /* ---------- input ----------
+     Handlers write into a single input command rather than mutating the player,
+     which is exactly the packet a networked client will send. Look angles stay
+     client-owned (recoil included) and are reported as absolutes. */
   setupInput() {
     this.keys = {};
     this.stick = { id: -1, ox: 0, oy: 0, x: 0, y: 0, mag: 0 };
@@ -725,22 +418,21 @@ export class Game {
     this.fireLookId = -1;
     this.firing = false;
     this.pointerLocked = false;
-    this.ads = 0;          // 0 = hip, 1 = fully aimed
-    this.adsOn = false;
     this.lookScale = 1;    // sensitivity follows fov while aiming
+
+    this.input = makeInput();
+    this.input.yaw = this.player.yaw;
+    this.input.pitch = this.player.pitch;
+    this.inputs = new Map([[this.player.name, this.input]]);
 
     const kd = e => {
       if (e.repeat) return;
       this.keys[e.code] = true;
-      if (e.code === "KeyR") this.startReload();
-      if (e.code === "Space") { e.preventDefault(); this.doVault(); }
-      if (e.code === "KeyC") this.toggleCrouch();
-      if (e.code === "ShiftLeft" || e.code === "ShiftRight") this.setSprint(true);
+      if (e.code === "KeyR") this.input.actions.reload = true;
+      if (e.code === "Space") { e.preventDefault(); this.input.actions.vault = true; }
+      if (e.code === "KeyC") this.input.actions.toggleCrouch = true;
     };
-    const ku = e => {
-      this.keys[e.code] = false;
-      if (e.code === "ShiftLeft" || e.code === "ShiftRight") this.setSprint(false);
-    };
+    const ku = e => { this.keys[e.code] = false; };
     this.bind(window, "keydown", kd);
     this.bind(window, "keyup", ku);
     // any focus loss drops every held input — a key/touch released off-window
@@ -764,7 +456,6 @@ export class Game {
       down: e => {
         this.sfx.ensure();
         this.firing = true;
-        this.setSprint(false);            // shooting always beats sprinting
         if (e.pointerType !== "mouse" && this.look.id === -1) {
           this.look.id = e.pointerId;
           this.look.lx = e.clientX;
@@ -780,10 +471,10 @@ export class Game {
     });
     // ADS toggles: tap to enter the sights, tap again to drop back to hip.
     // A hold would occupy a thumb you need for the trigger.
-    this.bindPress("btn-ads", () => this.toggleAds());
-    this.bindPress("btn-reload", () => this.startReload());
-    this.bindPress("btn-vault", () => this.doVault());
-    this.bindPress("btn-crouch", () => this.toggleCrouch());
+    this.bindPress("btn-ads", () => { this.input.actions.toggleAds = true; });
+    this.bindPress("btn-reload", () => { this.input.actions.reload = true; });
+    this.bindPress("btn-vault", () => { this.input.actions.vault = true; });
+    this.bindPress("btn-crouch", () => { this.input.actions.toggleCrouch = true; });
 
     // stage: free pointers drive the move stick (left) and the look camera
     const stage = this.$("stage");
@@ -794,7 +485,7 @@ export class Game {
       if (e.pointerType === "mouse") {
         if (!this.pointerLocked) { this.canvas.requestPointerLock?.(); return; }
         if (e.button === 0) this.firing = true;
-        if (e.button === 2) this.adsOn = true;
+        if (e.button === 2) this.requestAds(true);
         return;
       }
       if (e.clientX < window.innerWidth * 0.42 && this.stick.id === -1) {
@@ -814,9 +505,7 @@ export class Game {
     this.bind(stage, "pointermove", e => {
       if (e.pointerType === "mouse") {
         if (!this.pointerLocked || this.paused) return;
-        this.player.yaw -= e.movementX * 0.0023 * this.lookScale;
-        this.player.pitch -= e.movementY * 0.0023 * this.lookScale;
-        this.clampPitch();
+        this.addLook(-e.movementX * 0.0023, -e.movementY * 0.0023);
         return;
       }
       if (e.pointerId === this.stick.id) {
@@ -827,22 +516,22 @@ export class Game {
         this.stick.y = (dy * k) / cap;
         this.stick.mag = m / cap;         // uncapped: >1 means pushed past the ring
       } else if (e.pointerId === this.look.id) {
-        this.player.yaw -= (e.clientX - this.look.lx) * 0.0052 * this.lookScale;
-        this.player.pitch -= (e.clientY - this.look.ly) * 0.0052 * this.lookScale;
-        this.clampPitch();
+        this.addLook(
+          -(e.clientX - this.look.lx) * 0.0052,
+          -(e.clientY - this.look.ly) * 0.0052
+        );
         this.look.lx = e.clientX; this.look.ly = e.clientY;
       }
     });
 
     const release = e => {
       if (e.pointerType === "mouse") {
-        if (e.button === 2) this.adsOn = false;
+        if (e.button === 2) this.requestAds(false);
         this.firing = false;
         return;
       }
       if (e.pointerId === this.stick.id) {
         this.stick.id = -1; this.stick.x = 0; this.stick.y = 0; this.stick.mag = 0;
-        this.setSprint(false);
       }
       if (e.pointerId === this.look.id) this.look.id = -1;
     };
@@ -857,6 +546,21 @@ export class Game {
         this.$("overlay-pause").classList.add("active");
       }
     });
+  }
+
+  // Look is accumulated on the command, scaled by the current fov so aiming
+  // through a scope stays steady.
+  addLook(dYaw, dPitch) {
+    this.input.yaw += dYaw * this.lookScale;
+    this.input.pitch = Math.max(-1.35, Math.min(1.35, this.input.pitch + dPitch * this.lookScale));
+  }
+
+  /* The right mouse button is a hold while the on-screen button is a toggle.
+     The sim only understands a toggle — deliberately, since sprinting cancels
+     ADS and an absolute "still aiming" flag would immediately re-enable it. So
+     a hold is expressed as a toggle requested only when the state disagrees. */
+  requestAds(want) {
+    if (want !== this.player.adsOn) this.input.actions.toggleAds = true;
   }
 
   /* A momentary control: fires `down` on press and `up` on release, tracking
@@ -903,9 +607,218 @@ export class Game {
     this._bound.push([el, ev, fn, opts]);
   }
 
-  clampPitch() {
+  // Fold continuous input state into the command, once per frame.
+  syncInput() {
+    let mx = 0, mz = 0;
+    if (this.keys["KeyW"]) mz -= 1;
+    if (this.keys["KeyS"]) mz += 1;
+    if (this.keys["KeyA"]) mx -= 1;
+    if (this.keys["KeyD"]) mx += 1;
+    mx += this.stick.x; mz += this.stick.y;
+    const i = this.input;
+    i.moveX = mx; i.moveZ = mz;
+    i.stickMag = this.stick.mag;
+    i.stickY = this.stick.y;
+    i.stickActive = this.stick.id !== -1;
+    i.sprintKey = !!(this.keys["ShiftLeft"] || this.keys["ShiftRight"]);
+    i.firing = this.firing;
+  }
+
+  resetInput() {
+    this.keys = {};
+    this.stick.id = -1; this.stick.x = 0; this.stick.y = 0; this.stick.mag = 0;
+    this.look.id = -1;
+    this.fireLookId = -1;
+    this.firing = false;
+    const i = this.input;
+    i.moveX = 0; i.moveZ = 0; i.stickMag = 0; i.stickActive = false;
+    i.sprintKey = false; i.firing = false;
+    for (const id of ["btn-fire", "btn-ads", "btn-reload", "btn-vault", "btn-crouch"]) {
+      this.$(id).classList.remove("held");
+    }
+  }
+
+  /* ---------- sim driving ---------- */
+  stepSim(dt) {
+    const events = this.sim.step(dt, this.inputs);
+    for (const ev of events) this.handleEvent(ev);
+    if (this.sim.match.over && !this.over) this.endMatch();
+  }
+
+  // Everything audible or visible about what the sim just did.
+  handleEvent(ev) {
     const p = this.player;
-    p.pitch = Math.max(-1.35, Math.min(1.35, p.pitch));
+    switch (ev.type) {
+      case "fire": {
+        this.sfx.fire();
+        this.vmKick = 1;
+        // recoil is client-side: it moves this player's own aim, and the
+        // resulting absolute angle is what gets reported back
+        const L = this.loadout;
+        this.input.pitch += L.recoilKick * (0.7 + Math.random() * 0.5) * Math.PI / 180;
+        this.input.yaw += (Math.random() - 0.5) * L.recoilKick * 0.35 * Math.PI / 180;
+        this.input.pitch = Math.max(-1.35, Math.min(1.35, this.input.pitch));
+
+        const mz = this.$("muzzle");
+        mz.classList.remove("show"); void mz.offsetWidth; mz.classList.add("show");
+        this.vmFlash.visible = true;
+        clearTimeout(this._mf);
+        this._mf = setTimeout(() => { this.vmFlash.visible = false; }, 45);
+        const hudEl = this.$("hud");
+        hudEl.classList.remove("kick"); void hudEl.offsetWidth; hudEl.classList.add("kick");
+
+        if (ev.hit) {
+          this.sfx.hit();
+          const hm = this.$("hitmarker");
+          hm.classList.remove("show", "head"); void hm.offsetWidth;
+          hm.classList.add("show");
+          if (ev.hit.part === "HEAD") hm.classList.add("head");
+          if (!ev.hit.killed) {
+            this.setPrompt(`TARGET · ${Math.round(ev.hit.dist)}m · ${ev.hit.part}`);
+          }
+        }
+        break;
+      }
+      case "bot-shot": {
+        const dist = ev.bot.pos.distanceTo(p.pos);
+        if (dist < 60) this.sfx.enemyFire(dist);
+        ev.bot.eyePos(_a);
+        if (ev.target.isPlayer) { _b.copy(ev.target.pos); _b.y += 1.2; }
+        else ev.target.chestPos(_b);
+        if (!ev.hit) {
+          _b.x += (Math.random() - 0.5) * 2.4;
+          _b.y += (Math.random() - 0.2) * 1.4;
+          _b.z += (Math.random() - 0.5) * 2.4;
+        }
+        this.spawnTracer(_a, _b);
+        break;
+      }
+      case "hurt":
+        if (ev.victim === p) this.sfx.hurt();
+        break;
+      case "death": {
+        const victim = ev.victim, killer = ev.killer;
+        const mesh = this.botMeshes.get(victim.id);
+        if (mesh) mesh.visible = false;
+        this.addFeed(killer ? killer.name : "RAVENGLASS", victim.name,
+          killer ? killer.team === 0 : victim.team === 1);
+        if (victim === p) {
+          this.$("reload-ring").style.display = "none";
+          this.firing = false;
+          this.setPrompt("REDEPLOYING · STAND BY");
+        } else if (killer === p) {
+          this.sfx.kill();
+          this.setPrompt(`ELIMINATED ${victim.name} · +100`);
+        }
+        break;
+      }
+      case "respawn": {
+        const mesh = this.botMeshes.get(ev.ent.id);
+        if (mesh) mesh.visible = true;
+        if (ev.ent === p) { this.setPrompt(""); this.$("reload-ring").style.display = "none"; }
+        break;
+      }
+      case "reload-start":
+        this._rlPhase = -1;
+        this.setPrompt(`MAG SWAP · ${ev.time.toFixed(1)}s`);
+        this.$("reload-fill").style.width = "0%";
+        this.$("reload-cuff").style.width = "0%";
+        this.$("reload-ring").style.display = "flex";
+        break;
+      case "reload-complete":
+        this.$("reload-ring").style.display = "none";
+        this.$("reload-cuff").style.width = "0%";
+        this.setPrompt("");
+        break;
+      case "crouch-blocked":
+        this.setPrompt("NO HEADROOM · STAY LOW");
+        break;
+      case "vault-attempt":
+        this.sfx.vault();
+        break;
+      case "vault-mantle":
+        this.setPrompt("PARKOUR CHAIN ×2 · +4 TEMPO");
+        break;
+      default:
+        break;
+    }
+  }
+
+  endMatch() {
+    this.over = true;
+    const m = this.sim.match;
+    const rows = m.scoreboard();
+    setTimeout(() => this.onEnd({
+      won: m.score[0] > m.score[1],
+      ally: m.score[0], enemy: m.score[1], rows,
+    }), 900);
+  }
+
+  /* ---------- presentation ---------- */
+  present(dt) {
+    const p = this.player, L = this.loadout;
+
+    // bot transforms
+    for (const b of this.sim.bots) {
+      const mesh = this.botMeshes.get(b.id);
+      if (!mesh) continue;
+      mesh.position.set(b.pos.x, b.pos.y, b.pos.z);
+      mesh.rotation.y = b.yaw;
+    }
+
+    this.updateTracers(dt);
+
+    // ---- camera ----
+    this.camera.position.set(p.pos.x, p.pos.y + p.eyeH, p.pos.z);
+    this.camera.rotation.order = "YXZ";
+    this.camera.rotation.y = p.yaw;
+    this.camera.rotation.x = p.pitch;
+    // ADS fov zoom; look sensitivity tracks the zoom so aiming feels stable
+    const fov = 74 / (1 + (L.adsZoom - 1) * p.ads);
+    if (Math.abs(this.camera.fov - fov) > 0.01) {
+      this.camera.fov = fov;
+      this.camera.updateProjectionMatrix();
+    }
+    this.lookScale = fov / 74;
+
+    // viewmodel: reset to rest pose, then layer reload animation + recoil kick
+    const vm = this.viewmodel;
+    vm.rotation.set(0, 0, 0);
+    vm.position.set(0, 0, 0);
+    this.vmMag.position.copy(this.vmMagBase);
+    this.vmMag.rotation.set(0, 0, 0);
+    this.vmMag.visible = true;
+    if (p.alive && p.reloading > 0) {
+      this.animateReload(1 - p.reloading / L.reloadTime);
+    } else {
+      this._rlPhase = -1;
+    }
+
+    // sprint pose: weapon canted down and across, with a two-step run bob.
+    // sprintBlend also covers the raise back to centre via sprintOutT.
+    const wantSprint = (p.sprinting && p.alive) ? 1
+      : p.sprintOutT > 0 ? p.sprintOutT / SPRINT_OUT : 0;
+    this.sprintBlend += (wantSprint - this.sprintBlend) * Math.min(1, dt * 11);
+    if (this.sprintBlend > 0.002) {
+      const s = this.sprintBlend;
+      this.runT += dt * 11;
+      vm.rotation.z += 0.55 * s;
+      vm.rotation.x += 0.42 * s;
+      vm.rotation.y += 0.30 * s;
+      vm.position.y += (-0.13 + Math.sin(this.runT) * 0.022) * s;
+      vm.position.x += (0.06 + Math.cos(this.runT * 0.5) * 0.012) * s;
+      vm.position.z += 0.05 * s;
+    }
+    this.vmKick = Math.max(0, this.vmKick - dt * 9);
+    vm.position.z += this.vmKick * 0.06;
+    vm.rotation.x += this.vmKick * 0.05;
+    // ADS: bring the gun to center; fully-scoped sniper hides the viewmodel
+    vm.position.x = -0.26 * p.ads;
+    vm.position.y += 0.055 * p.ads;
+    vm.position.z += 0.1 * p.ads;
+    vm.visible = !(L.scope && p.ads > 0.9);
+
+    this.updateHud(dt);
   }
 
   /* ---------- HUD ---------- */
@@ -935,7 +848,6 @@ export class Game {
     this.$("reload-ring").style.display = "none";
     this.$("reload-fill").style.width = "0%";
     this.setPrompt("");
-    this.moveLabel = "SPRINT";
     this.hudCache = {};      // avoid touching the DOM when values are unchanged
     this.mmTimer = 0;        // minimap redraws at ~12 Hz, not every frame
   }
@@ -959,490 +871,33 @@ export class Game {
     setTimeout(() => { if (row.parentNode) row.remove(); }, 4200);
   }
 
-  /* ---------- combat events ---------- */
-  handleBotShot(bot, target, hit, dmg) {
-    // audio + tracer if near the player
-    const distToPlayer = bot.pos.distanceTo(this.player.pos);
-    if (distToPlayer < 60) this.sfx.enemyFire(distToPlayer);
-    bot.eyePos(_a);
-    if (target.isPlayer) { _b.copy(this.player.pos); _b.y += 1.2; } else { target.chestPos(_b); }
-    if (!hit) {
-      _b.x += (Math.random() - 0.5) * 2.4;
-      _b.y += (Math.random() - 0.2) * 1.4;
-      _b.z += (Math.random() - 0.5) * 2.4;
-    }
-    this.spawnTracer(_a, _b);
-
-    if (!hit) return;
-    if (target.isPlayer) {
-      this.damagePlayer(dmg, bot);
-    } else {
-      target.damage(dmg, bot, this.botCtx);
-    }
-  }
-
-  damagePlayer(dmg, attacker) {
-    const p = this.player;
-    if (!p.alive) return;
-    p.hp -= dmg;
-    p.lastHurt = this.time;
-    this.sfx.hurt();
-    if (p.hp <= 0) this.playerDie(attacker);
-  }
-
-  playerDie(killer) {
-    const p = this.player;
-    p.alive = false;
-    p.deaths++;
-    p.respawnT = 3.2;
-    p.reloading = 0;
-    p.vaultT = 0; p.vaultFrom = null; p.vaultTo = null; // no ghost-vault after respawn
-    this.adsOn = false; // hudSet syncs the button; ads lerps out via adsTarget
-    this.$("reload-ring").style.display = "none";
-    this.firing = false;
-    this.score[1]++;
-    if (killer) killer.kills = (killer.kills || 0) + 1;
-    this.addFeed(killer ? killer.name : "RAVENGLASS", p.name, false);
-    this.setPrompt("REDEPLOYING · STAND BY");
-    this.checkEnd();
-  }
-
-  handleDeath(bot, killer) {
-    bot.mesh.visible = false;
-    this.score[bot.team === 1 ? 0 : 1]++;
-    if (killer) {
-      killer.kills = (killer.kills || 0) + 1;
-      this.addFeed(killer.name, bot.name, killer.team === 0);
-      if (killer.isPlayer) {
-        this.sfx.kill();
-        this.setPrompt(`ELIMINATED ${bot.name} · +100`);
-      }
-    } else {
-      this.addFeed("RAVENGLASS", bot.name, bot.team === 1);
-    }
-    this.checkEnd();
-  }
-
-  checkEnd() {
-    if (this.over) return;
-    if (this.score[0] >= MATCH.killTarget || this.score[1] >= MATCH.killTarget || this.time <= 0) {
-      this.over = true;
-      const rows = this.combatants
-        .map(c => ({ name: c.name, team: c.team, kills: c.kills || 0, deaths: c.deaths || 0, me: !!c.isPlayer }))
-        .sort((a, b) => b.kills - a.kills);
-      setTimeout(() => this.onEnd({
-        won: this.score[0] > this.score[1],
-        ally: this.score[0], enemy: this.score[1], rows,
-      }), 900);
-    }
-  }
-
-  /* ---------- player actions ---------- */
-  startReload() {
+  /* The movement readout used to be assigned from a dozen scattered places,
+     which meant it could linger on a stale value. Deriving it from state each
+     frame is both shorter and always correct. */
+  moveLabel() {
     const p = this.player, L = this.loadout;
-    if (this.paused || this.over) return; // update() no longer runs — a reload would strand
-    if (!p.alive || p.reloading > 0 || p.ammo >= L.mag || p.reserve <= 0) return;
-    p.reloading = L.reloadTime;
-    this._rlPhase = -1;
-    this.setSprint(false);            // both hands on the weapon
-    this.moveLabel = "RELOADING";
-    this.setPrompt(`MAG SWAP · ${L.reloadTime.toFixed(1)}s`);
-    this.$("reload-fill").style.width = "0%";
-    this.$("reload-cuff").style.width = "0%";
-    this.$("reload-ring").style.display = "flex";
+    if (!p.alive) return "DOWN";
+    if (p.reloading > 0) return "RELOADING";
+    if (p.vaultT > 0) return "VAULT · MANTLE";
+    if (!p.grounded) return "AIRBORNE";
+    if (this.firing) return "FIRING";
+    if (p.sprinting) return "SPRINT";
+    if (p.crouching) return "CROUCH";
+    if (p.ads > 0.6) return L.scope ? "SCOPED" : "ADS";
+    return p.speedVal > 0.05 ? "MOVE" : "HOLD";
   }
-
-  toggleAds() {
-    if (!this.player.alive || this.paused || this.over) return;
-    this.adsOn = !this.adsOn;
-    if (this.adsOn) this.setSprint(false); // can't aim down sights at a run
-  }
-
-  setSprint(on) {
-    if (on && (!this.player.alive || this.paused || this.over || this.crouching)) return;
-    if (on === this.sprinting) return;
-    this.sprinting = on;
-    if (on) {
-      this.adsOn = false;
-    } else {
-      // leaving sprint costs a short raise time before the gun can fire
-      this.player.sprintOutT = SPRINT_OUT;
-    }
-  }
-
-  toggleCrouch() {
-    if (!this.player.alive || this.paused || this.over) return;
-    if (!this.crouching) {
-      this.crouching = true;
-      this.setSprint(false);
-      return;
-    }
-    // only stand back up if there is headroom (never clip into a container)
-    const p = this.player;
-    if (this.collides(p.pos.x, p.pos.z, p.radius, p.pos.y, p.pos.y + 1.8)) {
-      this.setPrompt("NO HEADROOM · STAY LOW");
-      return;
-    }
-    this.crouching = false;
-  }
-
-  resetInput() {
-    this.keys = {};
-    this.stick.id = -1; this.stick.x = 0; this.stick.y = 0; this.stick.mag = 0;
-    this.look.id = -1;
-    this.fireLookId = -1;
-    this.firing = false;
-    this.adsOn = false;
-    this.sprinting = false;
-    for (const id of ["btn-fire", "btn-ads", "btn-reload", "btn-vault", "btn-crouch"]) {
-      this.$(id).classList.remove("held");
-    }
-  }
-
-  // Push the player out of any box they are overlapping. Without this, ending
-  // up inside geometry fails BOTH axis tests in moveEntity forever — the
-  // "stuck and can't move" report. Costs one pass over the AABB list.
-  unstick(e) {
-    const r = e.radius, feet = e.pos.y, head = e.pos.y + (e.height || 1.8);
-    for (const b of this.boxes) {
-      if (b.top <= feet + 0.05 || b.y0 >= head) continue;   // standing on / under it
-      if (e.pos.x + r <= b.minX || e.pos.x - r >= b.maxX) continue;
-      if (e.pos.z + r <= b.minZ || e.pos.z - r >= b.maxZ) continue;
-      const outMinX = (e.pos.x + r) - b.minX;   // distance to escape via -x
-      const outMaxX = b.maxX - (e.pos.x - r);
-      const outMinZ = (e.pos.z + r) - b.minZ;
-      const outMaxZ = b.maxZ - (e.pos.z - r);
-      const m = Math.min(outMinX, outMaxX, outMinZ, outMaxZ);
-      if (m === outMinX) e.pos.x -= m + 0.02;
-      else if (m === outMaxX) e.pos.x += m + 0.02;
-      else if (m === outMinZ) e.pos.z -= m + 0.02;
-      else e.pos.z += m + 0.02;
-    }
-    const lim = ARENA - 0.15;
-    e.pos.x = Math.max(-lim, Math.min(lim, e.pos.x));
-    e.pos.z = Math.max(-lim, Math.min(lim, e.pos.z));
-    if (e.pos.y < -2) { e.pos.copy(this.spawnFor(e.team)); e.vy = 0; } // fell out of the world
-  }
-
-  doVault() {
-    const p = this.player;
-    if (!p.alive || p.vaultT > 0) return;
-    // probe ahead for a mantle-able ledge
-    const fx = -Math.sin(p.yaw), fz = -Math.cos(p.yaw);
-    const px = p.pos.x + fx * 1.15, pz = p.pos.z + fz * 1.15;
-    let ledge = null;
-    for (const b of this.boxes) {
-      if (px > b.minX - 0.3 && px < b.maxX + 0.3 && pz > b.minZ - 0.3 && pz < b.maxZ + 0.3) {
-        const rel = b.top - p.pos.y;
-        if (rel > 0.5 && rel < 1.9 && (!ledge || b.top < ledge.top)) ledge = b;
-      }
-    }
-    this.sfx.vault();
-    if (ledge) {
-      const to = new THREE.Vector3(
-        Math.max(ledge.minX + 0.5, Math.min(ledge.maxX - 0.5, px)),
-        ledge.top,
-        Math.max(ledge.minZ + 0.5, Math.min(ledge.maxZ - 0.5, pz))
-      );
-      // landing spot must have standing room — a stacked container or the
-      // perimeter wall above the ledge would entomb the player
-      if (this.collides(to.x, to.z, p.radius, to.y, to.y + p.height)) {
-        if (p.grounded) { p.vy = 5.6; p.grounded = false; this.moveLabel = "AIRBORNE"; }
-        return;
-      }
-      p.vaultT = 0.36;
-      p.vaultFrom = p.pos.clone();
-      p.vaultTo = to;
-      this.moveLabel = "VAULT · MANTLE";
-      this.setPrompt("PARKOUR CHAIN ×2 · +4 TEMPO");
-    } else if (p.grounded) {
-      p.vy = 5.6;
-      p.grounded = false;
-      this.moveLabel = "AIRBORNE";
-    }
-  }
-
-  tryFire() {
-    const p = this.player, L = this.loadout;
-    if (!p.alive || p.reloading > 0) return;
-    if (this.sprinting || p.sprintOutT > 0) return; // gun is down / coming up
-    if (p.shotT > 0) return;
-    if (p.ammo <= 0) { this.startReload(); return; }
-    if (!L.auto && this._semiHeld) return;
-    this._semiHeld = true;
-
-    p.shotT = 60 / L.rpm;
-    p.ammo--;
-    this.sfx.fire();
-    this.vmKick = 1;
-    this.moveLabel = "FIRING";
-
-    // spread: hip vs ADS interpolated by aim progress, movement penalty fades while aimed
-    const aim = this.ads;
-    const spreadMult = (L.hipSpreadMult + (L.adsSpreadMult - L.hipSpreadMult) * aim)
-      * (this.crouching ? 0.62 : 1);          // crouching steadies the weapon
-    const moveP = p.speedVal > 0.5 ? L.moveSpreadDeg * (1 - 0.7 * aim) : 0;
-    const spread = (L.spreadDeg * spreadMult + moveP) * Math.PI / 180;
-    const yawOff = (Math.random() - 0.5) * spread;
-    const pitchOff = (Math.random() - 0.5) * spread;
-    const yaw = p.yaw + yawOff, pitch = p.pitch + pitchOff;
-    const dx = -Math.sin(yaw) * Math.cos(pitch);
-    const dy = Math.sin(pitch);
-    const dz = -Math.cos(yaw) * Math.cos(pitch);
-    const ox = p.pos.x, oy = p.pos.y + p.eyeH, oz = p.pos.z;
-
-    const wallT = this.rayWorldDist(ox, oy, oz, dx, dy, dz, 200);
-    // bots are only hittable in front of whatever the round would strike first
-    const shot = this.raycastBots(ox, oy, oz, dx, dy, dz, Math.min(wallT, 200));
-    const hitBot = shot?.bot ?? null;
-    const hitT = shot?.t ?? Infinity;
-    const part = shot?.part ?? null;
-    const headshot = part?.name === "HEAD";
-
-    // muzzle flash DOM + 3D
-    const mz = this.$("muzzle");
-    mz.classList.remove("show"); void mz.offsetWidth; mz.classList.add("show");
-    this.vmFlash.visible = true;
-    clearTimeout(this._mf);
-    this._mf = setTimeout(() => { this.vmFlash.visible = false; }, 45);
-
-    // recoil
-    p.pitch += L.recoilKick * (0.7 + Math.random() * 0.5) * Math.PI / 180;
-    p.yaw += (Math.random() - 0.5) * L.recoilKick * 0.35 * Math.PI / 180;
-    this.clampPitch();
-    const hudEl = this.$("hud");
-    hudEl.classList.remove("kick"); void hudEl.offsetWidth; hudEl.classList.add("kick");
-
-    if (hitBot) {
-      let dmg = L.damage * part.mult;          // per-limb multiplier
-      const dist = hitT;
-      if (dist > L.falloffStart) {
-        const f = Math.max(0.45, 1 - (dist - L.falloffStart) / Math.max(1, L.falloffEnd - L.falloffStart) * 0.55);
-        dmg *= f;
-      }
-      this.sfx.hit();
-      const hm = this.$("hitmarker");
-      hm.classList.remove("show", "head"); void hm.offsetWidth;
-      hm.classList.add("show"); if (headshot) hm.classList.add("head");
-      const killed = hitBot.damage(dmg, this.player, this.botCtx);
-      if (!killed) this.setPrompt(`TARGET · ${Math.round(dist)}m · ${part.name}`);
-    }
-
-    if (p.ammo === 0) this.startReload();
-  }
-
-  /* ---------- per-frame ---------- */
-  update(dt) {
-    const p = this.player, L = this.loadout;
-    this.time -= dt;
-    if (this.time <= 0) { this.time = 0; this.checkEnd(); }
-
-    // ---- player respawn ----
-    if (!p.alive) {
-      p.respawnT -= dt;
-      if (p.respawnT <= 0) {
-        p.pos.copy(this.spawnFor(0));
-        p.hp = 100; p.alive = true; p.pitch = 0;
-        p.yaw = Math.atan2(p.pos.x, p.pos.z);
-        p.ammo = L.mag; p.reserve = L.reserve; p.reloading = 0;
-        this.$("reload-ring").style.display = "none";
-        this.setPrompt("");
-        this.moveLabel = "SPRINT";
-      }
-    }
-
-    // ---- ADS lerp: aiming drops while reloading or vaulting ----
-    const adsTarget = (this.adsOn && p.alive && p.reloading <= 0 && p.vaultT <= 0) ? 1 : 0;
-    const adsStep = dt / Math.max(0.05, L.adsTime);
-    this.ads += Math.sign(adsTarget - this.ads) * Math.min(Math.abs(adsTarget - this.ads), adsStep);
-
-    // ---- player movement ----
-    if (p.alive) {
-      if (p.vaultT > 0) {
-        p.vaultT -= dt;
-        const k = 1 - Math.max(0, p.vaultT) / 0.36;
-        p.pos.lerpVectors(p.vaultFrom, p.vaultTo, k);
-        p.pos.y = p.vaultFrom.y + (p.vaultTo.y - p.vaultFrom.y) * k + Math.sin(k * Math.PI) * 0.35;
-        if (p.vaultT <= 0) { p.pos.copy(p.vaultTo); p.grounded = true; p.vy = 0; }
-        p.speedVal = 3;
-      } else {
-        let mx = 0, mz = 0;
-        if (this.keys["KeyW"]) mz -= 1;
-        if (this.keys["KeyS"]) mz += 1;
-        if (this.keys["KeyA"]) mx -= 1;
-        if (this.keys["KeyD"]) mx += 1;
-        mx += this.stick.x; mz += this.stick.y;
-        const mlen = Math.hypot(mx, mz);
-        if (mlen > 1) { mx /= mlen; mz /= mlen; }
-        // Sprint is a stick gesture: shove the stick to the outer ring while
-        // heading forward. Hysteresis (0.95 in / 0.8 out) stops it flickering
-        // right at the boundary.
-        // Combat always outranks sprinting: while firing, aiming or reloading
-        // the stick may sit at the ring without dragging the player back into
-        // a sprint (which would cancel ADS and block the trigger every frame).
-        const busy = this.firing || this.adsOn || p.reloading > 0 || this.crouching;
-        const pushedToRing = (this.stick.mag ?? 0) >= 0.95 && this.stick.y < -0.35;
-        const backOff = (this.stick.mag ?? 0) < 0.8 || this.stick.y > -0.15;
-        if (busy) this.setSprint(false);
-        else if (this.stick.id !== -1) {
-          if (pushedToRing) this.setSprint(true);
-          else if (backOff) this.setSprint(false);
-        }
-        if (this.sprinting && mlen < 0.35) this.setSprint(false);
-        if (this.keys["ShiftLeft"] && mlen > 0.35 && !busy) this.setSprint(true);
-
-        const sin = Math.sin(p.yaw), cos = Math.cos(p.yaw);
-        const wx = (-sin * -mz) + (cos * mx);
-        const wz = (-cos * -mz) + (-sin * mx);
-        let speed = L.moveSpeed * (1 + (L.adsMoveMult - 1) * this.ads);
-        if (this.sprinting) speed *= SPRINT_MULT;
-        if (this.crouching) speed *= CROUCH_MULT;
-        this.moveEntity(p, wx * speed * dt, wz * speed * dt);
-        p.speedVal = mlen * speed;
-        if (p.reloading <= 0 && p.vaultT <= 0 && !this.firing && p.grounded) {
-          this.moveLabel = this.sprinting ? "SPRINT"
-            : this.crouching ? "CROUCH"
-            : this.ads > 0.6 ? (L.scope ? "SCOPED" : "ADS")
-            : mlen > 0.05 ? "MOVE" : "HOLD";
-        }
-
-        // gravity / ground
-        const ground = this.groundHeight(p.pos.x, p.pos.z, p.radius, p.pos.y);
-        p.vy -= GRAVITY * dt;
-        p.pos.y += p.vy * dt;
-        if (p.pos.y <= ground) { p.pos.y = ground; p.vy = 0; p.grounded = true; }
-        else if (p.pos.y > ground + 0.05) p.grounded = false;
-        this.unstick(p);
-      }
-
-      // stance: collision height and eye height follow the crouch state
-      p.height = this.crouching ? 1.2 : 1.8;
-      const wantEye = this.crouching ? EYE_CROUCH : EYE;
-      p.eyeH += (wantEye - p.eyeH) * Math.min(1, dt * 12);
-      if (p.sprintOutT > 0) p.sprintOutT -= dt;
-
-      // reload
-      if (p.reloading > 0) {
-        p.reloading -= dt;
-        if (p.reloading <= 0) {
-          const need = L.mag - p.ammo;
-          const take = Math.min(need, p.reserve);
-          p.ammo += take; p.reserve -= take;
-          this.$("reload-ring").style.display = "none";
-          this.$("reload-cuff").style.width = "0%";
-          this.moveLabel = "HOLD";
-          this.setPrompt("");
-        }
-      }
-
-      // fire
-      p.shotT -= dt;
-      if (this.firing) this.tryFire();
-      else this._semiHeld = false;
-
-      // hp regen after 4s
-      if (p.hp < 100 && this.timeSinceHurt() > 4) p.hp = Math.min(100, p.hp + 14 * dt);
-    }
-
-    // ---- bots ----
-    // Escalation ramps with whichever is further along: elapsed time or the
-    // leading score. Late rounds are faster, sharper and more aggressive.
-    const byTime = 1 - this.time / MATCH.timeLimit;
-    const byScore = Math.max(this.score[0], this.score[1]) / MATCH.killTarget;
-    this.botCtx.escalation = Math.min(1, Math.max(byTime, byScore));
-
-    // periodic coordinated push: a fireteam commits on the player's position
-    this.pushTimer -= dt;
-    if (this.pushTimer <= 0) {
-      this.pushTimer = 22 - 10 * this.botCtx.escalation;
-      if (this.player.alive) {
-        const squad = this.bots
-          .filter(b => b.team === 1 && b.alive)
-          .sort((x, y) => x.pos.distanceTo(this.player.pos) - y.pos.distanceTo(this.player.pos))
-          .slice(0, 2 + Math.round(this.botCtx.escalation * 2));
-        for (const b of squad) {
-          b.pushT = 6;
-          b.goal = this.player.pos.clone();
-          b.repathT = 6;
-        }
-      }
-    }
-
-    for (const b of this.bots) {
-      b.update(dt, this.botCtx);
-      if (b.mesh) {
-        b.mesh.position.copy(b.pos);
-        b.mesh.rotation.y = b.yaw;
-      }
-    }
-
-    this.updateTracers(dt);
-
-    // ---- camera ----
-    this.camera.position.set(p.pos.x, p.pos.y + p.eyeH, p.pos.z);
-    this.camera.rotation.order = "YXZ";
-    this.camera.rotation.y = p.yaw;
-    this.camera.rotation.x = p.pitch;
-    // ADS fov zoom; look sensitivity tracks the zoom so aiming feels stable
-    const fov = 74 / (1 + (L.adsZoom - 1) * this.ads);
-    if (Math.abs(this.camera.fov - fov) > 0.01) {
-      this.camera.fov = fov;
-      this.camera.updateProjectionMatrix();
-    }
-    this.lookScale = fov / 74;
-    // viewmodel: reset to rest pose, then layer reload animation + recoil kick
-    const vm = this.viewmodel;
-    vm.rotation.set(0, 0, 0);
-    vm.position.set(0, 0, 0);
-    this.vmMag.position.copy(this.vmMagBase);
-    this.vmMag.rotation.set(0, 0, 0);
-    this.vmMag.visible = true;
-    if (p.alive && p.reloading > 0) {
-      this.animateReload(1 - p.reloading / this.loadout.reloadTime);
-    } else {
-      this._rlPhase = -1;
-    }
-
-    // sprint pose: weapon canted down and across, with a two-step run bob.
-    // sprintBlend also covers the raise back to centre via sprintOutT.
-    const wantSprint = (this.sprinting && p.alive) ? 1
-      : p.sprintOutT > 0 ? p.sprintOutT / SPRINT_OUT : 0;
-    this.sprintBlend += (wantSprint - this.sprintBlend) * Math.min(1, dt * 11);
-    if (this.sprintBlend > 0.002) {
-      const s = this.sprintBlend;
-      this.runT += dt * 11;
-      vm.rotation.z += 0.55 * s;
-      vm.rotation.x += 0.42 * s;
-      vm.rotation.y += 0.30 * s;
-      vm.position.y += (-0.13 + Math.sin(this.runT) * 0.022) * s;
-      vm.position.x += (0.06 + Math.cos(this.runT * 0.5) * 0.012) * s;
-      vm.position.z += 0.05 * s;
-    }
-    this.vmKick = Math.max(0, this.vmKick - dt * 9);
-    vm.position.z += this.vmKick * 0.06;
-    vm.rotation.x += this.vmKick * 0.05;
-    // ADS: bring the gun to center; fully-scoped sniper hides the viewmodel
-    vm.position.x = -0.26 * this.ads;
-    vm.position.y += 0.055 * this.ads;
-    vm.position.z += 0.1 * this.ads;
-    vm.visible = !(L.scope && this.ads > 0.9);
-
-    this.updateHud(dt);
-  }
-
-  timeSinceHurt() { return (this.player.lastHurt === -10) ? 999 : Math.max(0, this.player.lastHurt - this.time); }
 
   updateHud(dt) {
-    const p = this.player;
+    const p = this.player, L = this.loadout, m = this.sim.match;
     this.hudSet("ammo", `${p.ammo}<span> / ${p.reserve}</span>`,
       v => { this.$("ammo-count").innerHTML = v; });
     this.hudSet("armor", Math.max(0, Math.round(p.hp)),
       v => { this.$("armor-fill").style.width = v + "%"; });
-    this.hudSet("move", p.alive ? this.moveLabel : "DOWN",
+    this.hudSet("move", this.moveLabel(),
       v => { this.$("move-state").textContent = v; });
-    this.hudSet("scoreA", this.score[0], v => { this.$("score-ally").textContent = v; });
-    this.hudSet("scoreB", this.score[1], v => { this.$("score-enemy").textContent = v; });
-    const t = Math.max(0, Math.ceil(this.time));
+    this.hudSet("scoreA", m.score[0], v => { this.$("score-ally").textContent = v; });
+    this.hudSet("scoreB", m.score[1], v => { this.$("score-enemy").textContent = v; });
+    const t = Math.max(0, Math.ceil(m.time));
     this.hudSet("clock", `${String(Math.floor(t / 60)).padStart(2, "0")}:${String(t % 60).padStart(2, "0")}`,
       v => { this.$("hud-clock").textContent = v; });
     this.hudSet("joy", `${Math.round(this.stick.x * 30)},${Math.round(this.stick.y * 30)}`, () => {
@@ -1451,31 +906,30 @@ export class Game {
     });
 
     // ADS visuals: crosshair tightens (hides behind a scope), overlay at full zoom
-    const L = this.loadout;
-    this.hudSet("ch", Math.round(this.ads * 24), () => {
+    this.hudSet("ch", Math.round(p.ads * 24), () => {
       const ch = this.$("crosshair");
-      ch.style.opacity = (L.scope && this.ads > 0.6) ? 0 : 1;
-      ch.style.transform = `translate(-50%,-50%) scale(${(1 - 0.4 * this.ads).toFixed(3)})`;
+      ch.style.opacity = (L.scope && p.ads > 0.6) ? 0 : 1;
+      ch.style.transform = `translate(-50%,-50%) scale(${(1 - 0.4 * p.ads).toFixed(3)})`;
     });
-    this.hudSet("scope", L.scope && this.ads > 0.92,
+    this.hudSet("scope", L.scope && p.ads > 0.92,
       v => { this.$("scope-overlay").style.display = v ? "block" : "none"; });
     // vignette is derived from state every frame, never from a timer that a
     // respawn or a forced heal could outlive
-    const hurtAge = this.timeSinceHurt();
+    const hurtAge = timeSinceHurt(p, m.time);
     const vig = !p.alive ? 0.85
       : hurtAge < 0.25 ? Math.min(1, 0.35 + (100 - p.hp) / 120)
       : p.hp < 35 ? 0.4
       : 0;
     this.hudSet("vig", vig.toFixed(2), v => { this.$("dmg-vignette").style.opacity = v; });
-    this.hudSet("sprintRing", this.sprinting,
+    this.hudSet("sprintRing", p.sprinting,
       v => this.$("joy-zone").classList.toggle("sprint", v));
-    this.hudSet("crouchBtn", this.crouching,
+    this.hudSet("crouchBtn", p.crouching,
       v => this.$("btn-crouch").classList.toggle("on", v));
-    this.hudSet("adsBtnHeld", this.adsOn,
+    this.hudSet("adsBtnHeld", p.adsOn,
       v => this.$("btn-ads").classList.toggle("on", v));
 
     // compass: strip spans are 55px per 45°
-    const yawDeg = ((-this.player.yaw * 180 / Math.PI) % 360 + 360) % 360;
+    const yawDeg = ((-p.yaw * 180 / Math.PI) % 360 + 360) % 360;
     const px = Math.round((-(yawDeg / 45) * 55 - 55 * 8 + 110 - 27.5) * 2) / 2;
     this.hudSet("compass", px, v => { this.$("compass-strip").style.transform = `translateX(${v}px)`; });
 
@@ -1492,7 +946,7 @@ export class Game {
       mm.beginPath(); mm.moveTo(0, i * S / 4); mm.lineTo(S, i * S / 4); mm.stroke();
     }
     const toMap = (x, z) => [S / 2 + x * scale, S / 2 + z * scale];
-    for (const b of this.bots) {
+    for (const b of this.sim.bots) {
       if (!b.alive) continue;
       const [x, y] = toMap(b.pos.x, b.pos.z);
       mm.fillStyle = b.team === 1 ? "#ff563c" : "rgba(243,242,242,0.55)";
@@ -1518,6 +972,7 @@ export class Game {
       document.exitPointerLock?.();
     } else {
       this.last = performance.now();
+      this.accum = 0;          // don't replay the paused interval
     }
   }
 
