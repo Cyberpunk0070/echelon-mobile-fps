@@ -71,6 +71,7 @@ export class Game {
     this.disposed = false;
     this.raf = 0;
     this.boxes = [];       // {minX,maxX,y0,top,minZ,maxZ}
+    this.boxSpecs = [];    // draw specs, batched into InstancedMeshes at map end
     this.tracers = [];
     this.feedTimers = [];
     this._bound = [];
@@ -108,16 +109,21 @@ export class Game {
         // adaptive resolution: if the phone can't hold frame time, step the
         // pixel ratio down (and back up when there's headroom)
         this.perfAccum += rawDt; this.perfFrames++;
-        if (rawDt < this.perfMin) this.perfMin = rawDt;
+        // 0.004 guard: ignore implausible sub-4ms deltas (rAF never
+        // legitimately paces above 250 Hz)
+        if (rawDt >= 0.004) {
+          if (rawDt < this.perfMin1) { this.perfMin2 = this.perfMin1; this.perfMin1 = rawDt; }
+          else if (rawDt < this.perfMin2) { this.perfMin2 = rawDt; }
+        }
         if (this.perfFrames >= 120) {
           const avg = this.perfAccum / this.perfFrames;
-          // recovery threshold derives from the display's measured refresh
-          // period — a fixed constant would be unreachable on 60 Hz vsync
-          const floor = this.perfMin;
-          this.perfAccum = 0; this.perfFrames = 0; this.perfMin = Infinity;
+          const floor = this.perfMin2 === Infinity ? 0.0167 : this.perfMin2;
+          this.perfAccum = 0; this.perfFrames = 0;
+          this.perfMin1 = Infinity; this.perfMin2 = Infinity;
           const scales = [1, 0.8, 0.65];
-          if (avg > 0.020 && this.perfLevel < 2) this.perfLevel++;
-          else if (avg < Math.max(0.011, floor * 1.15) && this.perfLevel > 0) this.perfLevel--;
+          // missing >~40% of vsyncs -> downscale; comfortably hitting them -> restore
+          if (avg > floor * 1.7 && this.perfLevel < 2) this.perfLevel++;
+          else if (avg < floor * 1.25 && this.perfLevel > 0) this.perfLevel--;
           const target = this.basePixelRatio * scales[this.perfLevel];
           if (Math.abs(this.renderer.getPixelRatio() - target) > 0.01) {
             this.renderer.setPixelRatio(target);
@@ -141,7 +147,11 @@ export class Game {
     });
     this.renderer.setPixelRatio(this.basePixelRatio);
     this.perfLevel = 0; this.perfAccum = 0; this.perfFrames = 0;
-    this.perfMin = Infinity; // per-window vsync floor estimate
+    // Per-window estimate of the display's vsync period, so the perf
+    // thresholds scale to 120 Hz or 60 Hz instead of a hardcoded budget.
+    // Two minima are tracked and the *second* smallest is used: rAF
+    // occasionally fires early, and a single outlier must not skew the floor.
+    this.perfMin1 = Infinity; this.perfMin2 = Infinity;
     this.geoCache = new THREE.BoxGeometry(1, 1, 1);
     this.matCache = new Map();
     this.scene = new THREE.Scene();
@@ -172,21 +182,40 @@ export class Game {
     return m;
   }
 
+  // Records a world box: an AABB for collision plus a draw spec. Nothing is
+  // added to the scene here — buildStaticMeshes() batches the specs into one
+  // InstancedMesh per color, which is what keeps the draw-call count flat.
   addBox(cx, cz, w, d, h, color, y0 = 0, stripe = null) {
-    // one shared unit-box geometry + cached materials keeps draw-call state
-    // and GPU memory small on mobile
-    const m = new THREE.Mesh(this.geoCache, this.mat(color));
-    m.scale.set(w, h, d);
-    m.position.set(cx, y0 + h / 2, cz);
-    this.scene.add(m);
+    this.boxSpecs.push({ x: cx, y: y0 + h / 2, z: cz, w, h, d, color });
     if (stripe) {
-      const sg = new THREE.Mesh(this.geoCache, this.mat(stripe));
-      sg.scale.set(w + 0.04, h * 0.18, d + 0.04);
-      sg.position.set(cx, y0 + h * 0.62, cz);
-      this.scene.add(sg);
+      this.boxSpecs.push({
+        x: cx, y: y0 + h * 0.62, z: cz,
+        w: w + 0.04, h: h * 0.18, d: d + 0.04, color: stripe,
+      });
     }
     this.boxes.push({ minX: cx - w / 2, maxX: cx + w / 2, minZ: cz - d / 2, maxZ: cz + d / 2, y0, top: y0 + h });
-    return m;
+  }
+
+  buildStaticMeshes() {
+    const byColor = new Map();
+    for (const s of this.boxSpecs) {
+      let list = byColor.get(s.color);
+      if (!list) { list = []; byColor.set(s.color, list); }
+      list.push(s);
+    }
+    const m4 = new THREE.Matrix4();
+    for (const [color, list] of byColor) {
+      const im = new THREE.InstancedMesh(this.geoCache, this.mat(color), list.length);
+      list.forEach((s, i) => {
+        m4.makeScale(s.w, s.h, s.d);
+        m4.setPosition(s.x, s.y, s.z);
+        im.setMatrixAt(i, m4);
+      });
+      im.instanceMatrix.needsUpdate = true;
+      im.frustumCulled = false; // instance bounds span the arena; culling can't help
+      this.scene.add(im);
+    }
+    this.boxSpecs = null;
   }
 
   buildMap() {
@@ -255,6 +284,8 @@ export class Game {
     }
     // central landmark: red monolith block (the "one red field")
     this.addBox(0, 0, 3.5, 3.5, 6.5, DARK.red);
+
+    this.buildStaticMeshes();
   }
 
   /* ---------- collision & rays ---------- */
@@ -437,8 +468,22 @@ export class Game {
     this.vmKick = 0;
     this._rlPhase = -1;
 
-    // tracer material (lines share it)
+    this.setupTracers();
+  }
+
+  // All tracers live in one LineSegments over a fixed buffer: one draw call
+  // and zero per-shot allocation, so heavy crossfire can't trigger GC hitches.
+  setupTracers() {
+    this.tracerMax = 64;
+    this.tracerPos = new Float32Array(this.tracerMax * 6);
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(this.tracerPos, 3));
+    geo.setDrawRange(0, 0);
     this.tracerMat = new THREE.LineBasicMaterial({ color: 0xffb3a6, transparent: true, opacity: 0.7 });
+    this.tracerMesh = new THREE.LineSegments(geo, this.tracerMat);
+    this.tracerMesh.frustumCulled = false;
+    this.scene.add(this.tracerMesh);
+    this.tracers = [];
   }
 
   // Staged reload: tilt in → mag drops out → grab pause → new mag seats →
@@ -479,10 +524,29 @@ export class Game {
   }
 
   spawnTracer(from, to) {
-    const geo = new THREE.BufferGeometry().setFromPoints([from.clone(), to.clone()]);
-    const line = new THREE.Line(geo, this.tracerMat);
-    this.scene.add(line);
-    this.tracers.push({ line, t: 0.06 });
+    if (this.tracers.length >= this.tracerMax) this.tracers.shift();
+    this.tracers.push({
+      ax: from.x, ay: from.y, az: from.z,
+      bx: to.x, by: to.y, bz: to.z, t: 0.06,
+    });
+  }
+
+  updateTracers(dt) {
+    const arr = this.tracers, pos = this.tracerPos;
+    let n = 0;
+    for (let i = 0; i < arr.length; i++) {
+      const tr = arr[i];
+      tr.t -= dt;
+      if (tr.t <= 0) continue;
+      arr[n] = tr;                       // compact survivors toward the front
+      const o = n * 6;
+      pos[o] = tr.ax; pos[o + 1] = tr.ay; pos[o + 2] = tr.az;
+      pos[o + 3] = tr.bx; pos[o + 4] = tr.by; pos[o + 5] = tr.bz;
+      n++;
+    }
+    arr.length = n;
+    this.tracerMesh.geometry.setDrawRange(0, n * 2);
+    this.tracerMesh.geometry.attributes.position.needsUpdate = true;
   }
 
   /* ---------- input ---------- */
@@ -985,16 +1049,7 @@ export class Game {
       }
     }
 
-    // ---- tracers ----
-    for (let i = this.tracers.length - 1; i >= 0; i--) {
-      const t = this.tracers[i];
-      t.t -= dt;
-      if (t.t <= 0) {
-        this.scene.remove(t.line);
-        t.line.geometry.dispose();
-        this.tracers.splice(i, 1);
-      }
-    }
+    this.updateTracers(dt);
 
     // ---- camera ----
     this.camera.position.set(p.pos.x, p.pos.y + EYE, p.pos.z);
@@ -1120,6 +1175,7 @@ export class Game {
     window.removeEventListener("resize", this._onResize);
     document.exitPointerLock?.();
     this.scene.traverse(o => {
+      if (o.isInstancedMesh) o.dispose(); // frees the per-instance matrix buffer
       if (o.geometry) o.geometry.dispose();
       if (o.material) (Array.isArray(o.material) ? o.material : [o.material]).forEach(m => {
         if (m.map) m.map.dispose();
