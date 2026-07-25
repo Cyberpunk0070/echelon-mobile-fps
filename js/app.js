@@ -290,7 +290,19 @@ function goto(name) {
 }
 
 /* ---------------- match flow ---------------- */
+// On Android, go fullscreen + lock landscape from the PLAY gesture.
+// Both calls are best-effort; desktop browsers just ignore the lock.
+async function goImmersive() {
+  try {
+    if (!document.fullscreenElement && document.documentElement.requestFullscreen) {
+      await document.documentElement.requestFullscreen({ navigationUI: "hide" });
+    }
+  } catch { /* not supported / denied */ }
+  try { await screen.orientation?.lock?.("landscape"); } catch { /* desktop */ }
+}
+
 function deploy() {
+  goImmersive();
   runBoot("deploy", startMatch);
 }
 
@@ -346,6 +358,7 @@ function initOverlays() {
   $("btn-requeue").addEventListener("click", () => {
     $("overlay-end").classList.remove("active");
     endGame();
+    goImmersive();
     runBoot("deploy", startMatch);
   });
   $("btn-tolobby").addEventListener("click", () => {

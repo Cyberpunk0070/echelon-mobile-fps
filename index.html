@@ -223,7 +223,10 @@ button{font-family:Archivo,system-ui,sans-serif;border:0;background:none;color:i
 #ammo-count span{font-size:15px;opacity:.5}
 #ammo-gun{font-size:9.5px;letter-spacing:.14em;opacity:.65;margin-top:2px}
 #hud-prompt{position:absolute;left:50%;bottom:14px;transform:translateX(-50%);font-size:9px;letter-spacing:.18em;opacity:.5;white-space:nowrap}
-#reload-ring{position:absolute;left:50%;top:58%;transform:translateX(-50%);font-size:10px;letter-spacing:.2em;color:var(--red);font-weight:800;display:none}
+#reload-ring{position:absolute;left:50%;top:58%;transform:translateX(-50%);display:none;flex-direction:column;align-items:center;gap:5px}
+#reload-ring .rl{font-size:10px;letter-spacing:.2em;color:var(--red);font-weight:800}
+#reload-track{width:96px;height:6px;background:var(--surface);border:1px solid var(--divider)}
+#reload-fill{height:100%;width:0%;background:var(--red)}
 
 /* ---------- OVERLAYS ---------- */
 .overlay{position:absolute;inset:0;display:none;z-index:40;background:rgba(10,9,8,.88);flex-direction:column;align-items:center;justify-content:center;gap:0}
@@ -394,7 +397,10 @@ button{font-family:Archivo,system-ui,sans-serif;border:0;background:none;color:i
     </div>
     <div id="crosshair"><div class="n"></div><div class="s"></div><div class="w"></div><div class="e"></div><div class="c"></div></div>
     <div id="hitmarker"><div class="a"></div><div class="b"></div><div class="c"></div><div class="d"></div></div>
-    <div id="reload-ring">RELOADING</div>
+    <div id="reload-ring">
+      <div class="rl">RELOADING</div>
+      <div id="reload-track"><div id="reload-fill"></div></div>
+    </div>
     <div id="dmg-vignette"></div>
     <div id="joy-zone"><div id="joy-knob"></div><div class="zl">MOVE</div></div>
     <div id="look-zone"><div class="zl">LOOK</div></div>
@@ -460,8 +466,9 @@ button{font-family:Archivo,system-ui,sans-serif;border:0;background:none;color:i
 </div>
 
 <script type="importmap">
-{ "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js" } }
+{ "imports": { "three": "./js/vendor/three.module.min.js" } }
 </script>
+<link rel="modulepreload" href="./js/vendor/three.module.min.js">
 <script type="module" src="./js/app.js"></script>
 </body>
 </html>

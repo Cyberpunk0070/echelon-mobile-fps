@@ -52,7 +52,9 @@ class Sfx {
   enemyFire(dist) { const v = Math.max(0.03, 0.3 - dist * 0.005); this.noise(0.08, v, 900); }
   hit() { this.tone(1900, 0.05, 0.22, "square"); }
   kill() { this.tone(780, 0.07, 0.25, "square"); setTimeout(() => this.tone(1170, 0.09, 0.25, "square"), 70); }
-  reload() { this.tone(420, 0.04, 0.18, "square"); setTimeout(() => this.tone(300, 0.05, 0.18, "square"), 140); }
+  magOut() { this.tone(340, 0.05, 0.22, "square", -90); this.noise(0.04, 0.12, 1500); }
+  magIn() { this.tone(230, 0.07, 0.26, "square", 50); this.noise(0.05, 0.16, 1100); }
+  rack() { this.tone(500, 0.04, 0.2, "square"); setTimeout(() => this.tone(380, 0.05, 0.2, "square"), 70); }
   hurt() { this.tone(110, 0.16, 0.4, "sawtooth", -40); }
   vault() { this.noise(0.12, 0.2, 500); }
 }
@@ -91,18 +93,45 @@ export class Game {
     const loop = (now) => {
       if (this.disposed) return;
       this.raf = requestAnimationFrame(loop);
-      let dt = (now - this.last) / 1000;
+      const rawDt = (now - this.last) / 1000;
       this.last = now;
-      if (dt > 0.05) dt = 0.05;
-      if (!this.paused && !this.over) this.update(dt);
+      const dt = Math.min(rawDt, 0.05);
+      if (!this.paused && !this.over) {
+        this.update(dt);
+        // adaptive resolution: if the phone can't hold frame time, step the
+        // pixel ratio down (and back up when there's headroom)
+        this.perfAccum += rawDt; this.perfFrames++;
+        if (this.perfFrames >= 120) {
+          const avg = this.perfAccum / this.perfFrames;
+          this.perfAccum = 0; this.perfFrames = 0;
+          const scales = [1, 0.8, 0.65];
+          if (avg > 0.020 && this.perfLevel < 2) this.perfLevel++;
+          else if (avg < 0.011 && this.perfLevel > 0) this.perfLevel--;
+          const target = this.basePixelRatio * scales[this.perfLevel];
+          if (Math.abs(this.renderer.getPixelRatio() - target) > 0.01) {
+            this.renderer.setPixelRatio(target);
+            this.resize();
+          }
+        }
+      }
       this.renderer.render(this.scene, this.camera);
     };
     this.raf = requestAnimationFrame(loop);
   }
 
   setupScene() {
-    this.renderer = new THREE.WebGLRenderer({ canvas: this.canvas, antialias: true });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    // high-dpi phones (S23 Ultra: dpr ~3) render at a capped ratio; MSAA is
+    // skipped there since the resolution already covers it
+    this.basePixelRatio = Math.min(window.devicePixelRatio || 1, 2);
+    this.renderer = new THREE.WebGLRenderer({
+      canvas: this.canvas,
+      antialias: this.basePixelRatio < 2,
+      powerPreference: "high-performance",
+    });
+    this.renderer.setPixelRatio(this.basePixelRatio);
+    this.perfLevel = 0; this.perfAccum = 0; this.perfFrames = 0;
+    this.geoCache = new THREE.BoxGeometry(1, 1, 1);
+    this.matCache = new Map();
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(DARK.bg);
     this.scene.fog = new THREE.Fog(DARK.bg, 30, 110);
@@ -125,17 +154,22 @@ export class Game {
     this.camera.updateProjectionMatrix();
   }
 
+  mat(color) {
+    let m = this.matCache.get(color);
+    if (!m) { m = new THREE.MeshLambertMaterial({ color }); this.matCache.set(color, m); }
+    return m;
+  }
+
   addBox(cx, cz, w, d, h, color, y0 = 0, stripe = null) {
-    const geo = new THREE.BoxGeometry(w, h, d);
-    const mat = new THREE.MeshLambertMaterial({ color });
-    const m = new THREE.Mesh(geo, mat);
+    // one shared unit-box geometry + cached materials keeps draw-call state
+    // and GPU memory small on mobile
+    const m = new THREE.Mesh(this.geoCache, this.mat(color));
+    m.scale.set(w, h, d);
     m.position.set(cx, y0 + h / 2, cz);
     this.scene.add(m);
     if (stripe) {
-      const sg = new THREE.Mesh(
-        new THREE.BoxGeometry(w + 0.04, h * 0.18, d + 0.04),
-        new THREE.MeshLambertMaterial({ color: stripe })
-      );
+      const sg = new THREE.Mesh(this.geoCache, this.mat(stripe));
+      sg.scale.set(w + 0.04, h * 0.18, d + 0.04);
       sg.position.set(cx, y0 + h * 0.62, cz);
       this.scene.add(sg);
     }
@@ -347,19 +381,19 @@ export class Game {
     const grp = new THREE.Group();
     const bodyCol = team === 1 ? 0x3b322f : 0x565150;
     const accCol = team === 1 ? DARK.red : 0xd8d5d2;
-    const body = new THREE.Mesh(new THREE.BoxGeometry(0.62, 1.12, 0.4), new THREE.MeshLambertMaterial({ color: bodyCol }));
-    body.position.y = 0.94;
-    const head = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.3, 0.3), new THREE.MeshLambertMaterial({ color: bodyCol }));
-    head.position.y = 1.68;
-    const visor = new THREE.Mesh(new THREE.BoxGeometry(0.32, 0.07, 0.31), new THREE.MeshLambertMaterial({ color: accCol }));
-    visor.position.set(0, 1.7, -0.01);
-    const stripe = new THREE.Mesh(new THREE.BoxGeometry(0.66, 0.12, 0.44), new THREE.MeshLambertMaterial({ color: accCol }));
-    stripe.position.y = 1.32;
-    const legs = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.42, 0.34), new THREE.MeshLambertMaterial({ color: 0x1e1b1a }));
-    legs.position.y = 0.21;
-    const gun = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.12, 0.7), new THREE.MeshLambertMaterial({ color: 0x151312 }));
-    gun.position.set(0.22, 1.18, -0.36);
-    grp.add(body, head, visor, stripe, legs, gun);
+    const part = (w, h, d, x, y, z, c) => {
+      const m = new THREE.Mesh(this.geoCache, this.mat(c));
+      m.scale.set(w, h, d);
+      m.position.set(x, y, z);
+      grp.add(m);
+      return m;
+    };
+    part(0.62, 1.12, 0.4, 0, 0.94, 0, bodyCol);           // body
+    part(0.3, 0.3, 0.3, 0, 1.68, 0, bodyCol);             // head
+    part(0.32, 0.07, 0.31, 0, 1.7, -0.01, accCol);        // visor
+    part(0.66, 0.12, 0.44, 0, 1.32, 0, accCol);           // stripe
+    part(0.5, 0.42, 0.34, 0, 0.21, 0, 0x1e1b1a);          // legs
+    part(0.1, 0.12, 0.7, 0.22, 1.18, -0.36, 0x151312);    // gun
     grp.visible = false;
     this.scene.add(grp);
     return grp;
@@ -369,7 +403,8 @@ export class Game {
     // honest schematic blocks — the design's assembling parts, held in-hand
     const vm = new THREE.Group();
     const mk = (w, h, d, x, y, z, c) => {
-      const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), new THREE.MeshLambertMaterial({ color: c }));
+      const m = new THREE.Mesh(this.geoCache, this.mat(c));
+      m.scale.set(w, h, d);
       m.position.set(x, y, z);
       vm.add(m);
       return m;
@@ -377,17 +412,58 @@ export class Game {
     mk(0.09, 0.1, 0.5, 0.26, -0.24, -0.55, 0x2e2b29);        // receiver
     mk(0.05, 0.05, 0.42, 0.26, -0.21, -0.95, 0x413c3a);      // barrel
     mk(0.012, 0.05, 0.05, 0.26, -0.155, -0.62, DARK.red);    // optic accent
-    mk(0.07, 0.16, 0.1, 0.26, -0.36, -0.48, 0x242120);       // magazine
-    this.vmFlash = mk(0.09, 0.09, 0.09, 0.26, -0.2, -1.2, DARK.red);
-    this.vmFlash.material = new THREE.MeshBasicMaterial({ color: DARK.red });
+    this.vmMag = mk(0.07, 0.16, 0.1, 0.26, -0.36, -0.48, 0x242120); // magazine
+    this.vmMagBase = this.vmMag.position.clone();
+    this.vmFlash = new THREE.Mesh(this.geoCache, new THREE.MeshBasicMaterial({ color: DARK.red }));
+    this.vmFlash.scale.set(0.09, 0.09, 0.09);
+    this.vmFlash.position.set(0.26, -0.2, -1.2);
     this.vmFlash.visible = false;
+    vm.add(this.vmFlash);
     this.viewmodel = vm;
     this.camera.add(vm);
     this.scene.add(this.camera);
     this.vmKick = 0;
+    this._rlPhase = -1;
 
-    // tracer pool
+    // tracer material (lines share it)
     this.tracerMat = new THREE.LineBasicMaterial({ color: 0xffb3a6, transparent: true, opacity: 0.7 });
+  }
+
+  // Staged reload: tilt in → mag drops out → grab pause → new mag seats →
+  // charging-handle rack, all scaled to the loadout's real reload time.
+  animateReload(t) {
+    const ph = t < 0.15 ? 0 : t < 0.45 ? 1 : t < 0.55 ? 2 : t < 0.8 ? 3 : 4;
+    if (ph !== this._rlPhase) {
+      this._rlPhase = ph;
+      if (ph === 1) this.sfx.magOut();
+      if (ph === 3) this.sfx.magIn();
+      if (ph === 4) this.sfx.rack();
+    }
+    const ease = x => x * x * (3 - 2 * x);
+    const vm = this.viewmodel, mag = this.vmMag;
+    // whole-gun tilt toward the player while hands work the mag well
+    const tilt = t < 0.15 ? ease(t / 0.15) : t > 0.8 ? 1 - ease((t - 0.8) / 0.2) : 1;
+    vm.rotation.z = 0.22 * tilt;
+    vm.rotation.x = 0.13 * tilt;
+    vm.position.y = -0.05 * tilt;
+    // magazine out / in
+    let magY = 0, magRX = 0, magVisible = true;
+    if (t >= 0.15 && t < 0.45) {
+      const k = ease((t - 0.15) / 0.3);
+      magY = -0.42 * k; magRX = -0.75 * k;
+    } else if (t >= 0.45 && t < 0.55) {
+      magVisible = false;                      // old mag away, grabbing fresh one
+    } else if (t >= 0.55 && t < 0.8) {
+      const k = ease((t - 0.55) / 0.25);
+      magY = -0.42 * (1 - k); magRX = -0.75 * (1 - k);
+    } else if (t >= 0.8) {
+      // rack: quick back-and-forward jolt of the whole gun
+      vm.position.z = 0.07 * Math.sin(((t - 0.8) / 0.2) * Math.PI);
+    }
+    mag.position.y = this.vmMagBase.y + magY;
+    mag.rotation.x = magRX;
+    mag.visible = magVisible;
+    this.$("reload-fill").style.width = (t * 100).toFixed(0) + "%";
   }
 
   spawnTracer(from, to) {
@@ -488,6 +564,14 @@ export class Game {
     this.bind(fireBtn, "mouseup", fend);
     this.bind(this.$("btn-reload"), "click", () => this.startReload());
     this.bind(this.$("btn-vault"), "click", () => this.doVault());
+
+    // mobile: tabbing away / locking the screen pauses the match
+    this.bind(document, "visibilitychange", () => {
+      if (document.hidden && !this.paused && !this.over) {
+        this.setPaused(true);
+        this.$("overlay-pause").classList.add("active");
+      }
+    });
   }
 
   bind(el, ev, fn, opts) {
@@ -519,6 +603,14 @@ export class Game {
     this.$("killfeed").innerHTML = "";
     this.setPrompt("HOLD LEFT EDGE TO SLIDE");
     this.moveLabel = "SPRINT";
+    this.hudCache = {};      // avoid touching the DOM when values are unchanged
+    this.mmTimer = 0;        // minimap redraws at ~12 Hz, not every frame
+  }
+
+  hudSet(key, value, apply) {
+    if (this.hudCache[key] === value) return;
+    this.hudCache[key] = value;
+    apply(value);
   }
 
   setPrompt(t) { this.$("hud-prompt").textContent = t; }
@@ -574,6 +666,8 @@ export class Game {
     p.alive = false;
     p.deaths++;
     p.respawnT = 3.2;
+    p.reloading = 0;
+    this.$("reload-ring").style.display = "none";
     this.firing = false;
     this.score[1]++;
     if (killer) killer.kills = (killer.kills || 0) + 1;
@@ -618,10 +712,11 @@ export class Game {
     const p = this.player, L = this.loadout;
     if (!p.alive || p.reloading > 0 || p.ammo >= L.mag || p.reserve <= 0) return;
     p.reloading = L.reloadTime;
-    this.sfx.reload();
+    this._rlPhase = -1;
     this.moveLabel = "RELOADING";
     this.setPrompt(`MAG SWAP · ${L.reloadTime.toFixed(1)}s`);
-    this.$("reload-ring").style.display = "block";
+    this.$("reload-fill").style.width = "0%";
+    this.$("reload-ring").style.display = "flex";
   }
 
   doVault() {
@@ -743,6 +838,7 @@ export class Game {
         p.hp = 100; p.alive = true; p.pitch = 0;
         p.yaw = Math.atan2(p.pos.x, p.pos.z);
         p.ammo = L.mag; p.reserve = L.reserve; p.reloading = 0;
+        this.$("reload-ring").style.display = "none";
         this.$("dmg-vignette").style.opacity = 0;
         this.setPrompt("HOLD LEFT EDGE TO SLIDE");
         this.moveLabel = "SPRINT";
@@ -835,35 +931,54 @@ export class Game {
     this.camera.rotation.order = "YXZ";
     this.camera.rotation.y = p.yaw;
     this.camera.rotation.x = p.pitch;
-    // viewmodel kick
+    // viewmodel: reset to rest pose, then layer reload animation + recoil kick
+    const vm = this.viewmodel;
+    vm.rotation.set(0, 0, 0);
+    vm.position.set(0, 0, 0);
+    this.vmMag.position.copy(this.vmMagBase);
+    this.vmMag.rotation.set(0, 0, 0);
+    this.vmMag.visible = true;
+    if (p.alive && p.reloading > 0) {
+      this.animateReload(1 - p.reloading / this.loadout.reloadTime);
+    } else {
+      this._rlPhase = -1;
+    }
     this.vmKick = Math.max(0, this.vmKick - dt * 9);
-    this.viewmodel.position.z = this.vmKick * 0.06;
-    this.viewmodel.position.y = p.reloading > 0 ? -0.14 : 0;
-    this.viewmodel.rotation.x = this.vmKick * 0.05 + (p.reloading > 0 ? 0.35 : 0);
+    vm.position.z += this.vmKick * 0.06;
+    vm.rotation.x += this.vmKick * 0.05;
 
-    this.updateHud();
+    this.updateHud(dt);
   }
 
   timeSinceHurt() { return (this.player.lastHurt === -10) ? 999 : Math.max(0, this.player.lastHurt - this.time); }
 
-  updateHud() {
+  updateHud(dt) {
     const p = this.player;
-    this.$("ammo-count").innerHTML = `${p.ammo}<span> / ${p.reserve}</span>`;
-    this.$("armor-fill").style.width = Math.max(0, p.hp) + "%";
-    this.$("move-state").textContent = p.alive ? this.moveLabel : "DOWN";
-    this.$("score-ally").textContent = this.score[0];
-    this.$("score-enemy").textContent = this.score[1];
+    this.hudSet("ammo", `${p.ammo}<span> / ${p.reserve}</span>`,
+      v => { this.$("ammo-count").innerHTML = v; });
+    this.hudSet("armor", Math.max(0, Math.round(p.hp)),
+      v => { this.$("armor-fill").style.width = v + "%"; });
+    this.hudSet("move", p.alive ? this.moveLabel : "DOWN",
+      v => { this.$("move-state").textContent = v; });
+    this.hudSet("scoreA", this.score[0], v => { this.$("score-ally").textContent = v; });
+    this.hudSet("scoreB", this.score[1], v => { this.$("score-enemy").textContent = v; });
     const t = Math.max(0, Math.ceil(this.time));
-    this.$("hud-clock").textContent = `${String(Math.floor(t / 60)).padStart(2, "0")}:${String(t % 60).padStart(2, "0")}`;
-    this.$("joy-knob").style.transform =
-      `translate(calc(-50% + ${Math.round(this.stick.x * 30)}px), calc(-50% + ${Math.round(this.stick.y * 30)}px))`;
+    this.hudSet("clock", `${String(Math.floor(t / 60)).padStart(2, "0")}:${String(t % 60).padStart(2, "0")}`,
+      v => { this.$("hud-clock").textContent = v; });
+    this.hudSet("joy", `${Math.round(this.stick.x * 30)},${Math.round(this.stick.y * 30)}`, () => {
+      this.$("joy-knob").style.transform =
+        `translate(calc(-50% + ${Math.round(this.stick.x * 30)}px), calc(-50% + ${Math.round(this.stick.y * 30)}px))`;
+    });
 
     // compass: strip spans are 55px per 45°
     const yawDeg = ((-this.player.yaw * 180 / Math.PI) % 360 + 360) % 360;
-    const px = -(yawDeg / 45) * 55 - 55 * 8 + 110 - 27.5;
-    this.$("compass-strip").style.transform = `translateX(${px}px)`;
+    const px = Math.round((-(yawDeg / 45) * 55 - 55 * 8 + 110 - 27.5) * 2) / 2;
+    this.hudSet("compass", px, v => { this.$("compass-strip").style.transform = `translateX(${v}px)`; });
 
-    // minimap
+    // minimap (throttled)
+    this.mmTimer -= dt;
+    if (this.mmTimer > 0) return;
+    this.mmTimer = 1 / 12;
     const mm = this.mm, S = 104, scale = S / (ARENA * 2 + 4);
     mm.clearRect(0, 0, S, S);
     mm.strokeStyle = "rgba(243,242,242,0.16)";
