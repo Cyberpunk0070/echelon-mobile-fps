@@ -10,7 +10,8 @@
 ### ▶ [**Play it now — warm-sun-523.higgsfield.gg**](https://warm-sun-523.higgsfield.gg/)
 
 *Open on a phone in landscape, or on desktop with WASD + mouse.*
-*Android build: [`ECHELON-debug.apk`](#building-the-apk) — sideload for immersive fullscreen at the panel's native 120 Hz.*
+
+**Android:** [**download the APK**](https://github.com/Cyberpunk0070/echelon-mobile-fps/releases/latest) — immersive fullscreen at the panel's native 120 Hz, fully offline.
 
 `vanilla JS` · `Three.js r160` · `no build step` · `~250 KB` · `offline-capable`
 
