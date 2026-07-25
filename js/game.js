@@ -902,7 +902,7 @@ export class Game {
     // mid-reload match end could have left stranded
     this.$("reload-ring").style.display = "none";
     this.$("reload-fill").style.width = "0%";
-    this.setPrompt("HOLD LEFT EDGE TO SLIDE");
+    this.setPrompt("");
     this.moveLabel = "SPRINT";
     this.hudCache = {};      // avoid touching the DOM when values are unchanged
     this.mmTimer = 0;        // minimap redraws at ~12 Hz, not every frame
@@ -1235,7 +1235,7 @@ export class Game {
         p.yaw = Math.atan2(p.pos.x, p.pos.z);
         p.ammo = L.mag; p.reserve = L.reserve; p.reloading = 0;
         this.$("reload-ring").style.display = "none";
-        this.setPrompt("HOLD LEFT EDGE TO SLIDE");
+        this.setPrompt("");
         this.moveLabel = "SPRINT";
       }
     }

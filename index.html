@@ -272,7 +272,8 @@ body.in-match #status-strip{display:none}
 #ammo-count span{font-size:15px;opacity:.5}
 #ammo-gun{font-size:9.5px;letter-spacing:.14em;opacity:.65;margin-top:2px}
 /* the centre channel between the two clusters is the only place text may sit */
-#hud-prompt{position:absolute;left:50%;bottom:var(--edge-b);transform:translateX(-50%);font-size:9px;letter-spacing:.18em;opacity:.5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:34vw;text-align:center;pointer-events:none}
+/* sits above both thumb clusters, clear of the ammo readout */
+#hud-prompt{position:absolute;left:50%;bottom:calc(var(--edge-b) + 190px);transform:translateX(-50%);font-size:10px;letter-spacing:.18em;opacity:.6;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:46vw;text-align:center;pointer-events:none}
 #reload-ring{position:absolute;left:50%;top:58%;transform:translateX(-50%);display:none;flex-direction:column;align-items:center;gap:5px}
 #reload-ring .rl{font-size:10px;letter-spacing:.2em;color:var(--red);font-weight:800}
 #reload-track{width:96px;height:6px;background:var(--surface);border:1px solid var(--divider)}
