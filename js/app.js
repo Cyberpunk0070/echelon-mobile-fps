@@ -1,17 +1,21 @@
-// ECHELON — app shell: boot sequence, lobby, loadout, gunsmith, match flow.
+// ECHELON — app shell: boot sequence, lobby, armory, settings, match flow.
 import {
   LOG, DEPLOY_LOG, PARTS, PHASES, DEPLOY_PHASES,
   WEAPONS, ATTS, STAT_NAMES, statsFor, buildLoadout, MATCH,
 } from "./data.js";
 import { Game } from "./game.js";
+import {
+  settings, saveSettings, resetSettings, resetLayout,
+  applyHud, applyLayout, captureLayout, HUD_ELEMENTS,
+} from "./settings.js";
+import { describeWeapon, sideViewSvg, attKeys } from "./weapons3d.js";
 
+const BUILD = "5.1.0";
 const $ = id => document.getElementById(id);
-const state = {
-  screen: "boot",
-  weapon: 0,
-  atts: [0, 1, 0, 1, 0, 1],   // matches the design's default fit
-  game: null,
-};
+const state = { screen: "boot", game: null, bootDone: null };
+
+const curWeapon = () => settings.loadout.weapon;
+const curAtts = () => settings.loadout.atts[curWeapon()];
 
 /* ---------------- screen switching ---------------- */
 function showScreen(name) {
@@ -37,9 +41,8 @@ function runBoot(mode, onDone) {
   $("boot-footer").textContent = "DO NOT CLOSE THE APP";
   $("boot-caption").textContent = deploy
     ? "TERRAIN MESH · RAVENGLASS DOCKYARD · 2.1km²"
-    : "ASSEMBLING VIEWMODEL · " + WEAPONS[state.weapon].name + " · 214k TRIS";
+    : "ASSEMBLING VIEWMODEL · " + WEAPONS[curWeapon()].name;
 
-  // ticks (once)
   if (!$("boot-ticks").children.length) {
     for (let i = 0; i < 24; i++) $("boot-ticks").appendChild(document.createElement("div"));
   }
@@ -98,232 +101,223 @@ function runBoot(mode, onDone) {
   };
   render();
 
+  const finish = () => {
+    clearInterval(bootTimer);
+    state.bootDone = null;
+    onDone();
+  };
+  state.bootDone = finish;
+
   bootTimer = setInterval(() => {
     if (hold > 0) { hold--; return; }
     if (pct >= 100) {
       clearInterval(bootTimer);
-      $("boot-footer").textContent = deploy ? "DEPLOYING ▸" : "SQUAD LINKED · ENTERING LOBBY";
-      setTimeout(onDone, 520);
+      $("boot-footer").textContent = deploy ? "DEPLOYING ▸" : "ENTERING LOBBY";
+      setTimeout(() => { if (state.bootDone) finish(); }, 420);
       return;
     }
-    const next = Math.min(100, pct + 2 + Math.floor(Math.random() * 9));
+    const next = Math.min(100, pct + 3 + Math.floor(Math.random() * 11));
     const crossed = phases.some(ph => pct < ph[0] && next >= ph[0]);
     pct = next;
     render();
     if (crossed) {
-      hold = 4;
+      hold = 3;
       $("boot-pct").classList.add("glitching");
       setTimeout(() => $("boot-pct").classList.remove("glitching"), 160);
     }
-  }, 90);
+  }, 80);
+}
+
+// Real device facts instead of invented ping/region numbers.
+function fillSystemInfo() {
+  let gpu = "WEBGL";
+  try {
+    const c = document.createElement("canvas");
+    const gl = c.getContext("webgl2") || c.getContext("webgl");
+    const dbg = gl?.getExtension("WEBGL_debug_renderer_info");
+    const raw = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl?.getParameter(gl.RENDERER);
+    if (raw) gpu = String(raw).replace(/\s*\(.*?\)\s*/g, " ").trim().slice(0, 26);
+  } catch { /* blocked by privacy settings */ }
+  $("sys-gpu").textContent = gpu;
+  $("sys-res").textContent = `${window.innerWidth}×${window.innerHeight} @${(window.devicePixelRatio || 1).toFixed(1)}x`;
+  $("sys-weapon").textContent = WEAPONS[curWeapon()].name;
+  $("sys-build").textContent = BUILD;
+}
+
+/* ---------------- weapon schematic ---------------- */
+// Side elevation of the exact build the player is carrying, with leader lines
+// drawn to real part positions rather than hand-placed coordinates.
+function weaponSchematic(weaponIdx, atts, { w = 520, h = 260, pins = true } = {}) {
+  const spec = describeWeapon(WEAPONS[weaponIdx].model, attKeys(ATTS, atts));
+  const gutter = pins ? Math.min(132, Math.max(96, w * 0.16)) : 18;
+  const view = sideViewSvg(spec, { w, h, padX: gutter, padY: pins ? 26 : 16 });
+
+  // technical-drawing furniture: a faint grid and a real overall-length
+  // dimension taken straight off the model, which is built at life size
+  const grid = Array.from({ length: Math.ceil(w / 40) }, (_, i) =>
+    `<line x1="${i * 40}" y1="0" x2="${i * 40}" y2="${h}"/>`).join("")
+    + Array.from({ length: Math.ceil(h / 40) }, (_, i) =>
+      `<line x1="0" y1="${i * 40}" x2="${w}" y2="${i * 40}"/>`).join("");
+  let dim = "";
+  if (pins) {
+    const b = view.bounds;
+    const x0 = view.X(b.minU), x1 = view.X(b.maxU);
+    const yb = Math.min(h - 30, view.Y(b.minV) + 34);
+    const mm = Math.round((b.maxU - b.minU) * 1000);
+    dim = `<g stroke="rgba(243,242,242,.3)" stroke-width="1">
+      <line x1="${x0.toFixed(1)}" y1="${yb}" x2="${x1.toFixed(1)}" y2="${yb}"/>
+      <line x1="${x0.toFixed(1)}" y1="${yb - 5}" x2="${x0.toFixed(1)}" y2="${yb + 5}"/>
+      <line x1="${x1.toFixed(1)}" y1="${yb - 5}" x2="${x1.toFixed(1)}" y2="${yb + 5}"/>
+    </g>
+    <text x="${((x0 + x1) / 2).toFixed(1)}" y="${yb + 17}" text-anchor="middle"
+      font-family="Archivo,sans-serif" font-size="9" font-weight="700"
+      letter-spacing="1.4" fill="rgba(243,242,242,.42)">OVERALL ${mm} mm</text>`;
+  }
+
+  let pinSvg = "";
+  if (pins) {
+    // Labels live in fixed gutters either side and stack downward, so no
+    // callout can ever run off the panel or collide with another.
+    const entries = Object.entries(spec.anchors || {})
+      .map(([label, [z, y]]) => ({ label, p: view.project(z, y) }))
+      .sort((a, b) => a.p[1] - b.p[1]);
+    const cols = { L: [], R: [] };
+    for (const e of entries) cols[e.p[0] < w / 2 ? "L" : "R"].push(e);
+    pinSvg = ["L", "R"].flatMap(side => {
+      const right = side === "R";
+      const colX = Math.round(right ? w - gutter + 16 : gutter - 16);
+      const list = cols[side];
+      const top = (h - (list.length - 1) * 24) / 2;
+      return list.map((e, i) => {
+        const [px, py] = e.p;
+        const ly = Math.round(top + i * 24);
+        const stub = colX + (right ? 12 : -12);
+        return `<g>
+          <polyline points="${px.toFixed(1)},${py.toFixed(1)} ${colX},${ly} ${stub},${ly}"
+            fill="none" stroke="#ff563c" stroke-width="1.2" opacity=".75"/>
+          <rect x="${(px - 3).toFixed(1)}" y="${(py - 3).toFixed(1)}" width="6" height="6" fill="#ff563c"/>
+          <text x="${stub + (right ? 5 : -5)}" y="${ly + 3.5}" text-anchor="${right ? "start" : "end"}"
+            font-family="Archivo,sans-serif" font-size="9" font-weight="800"
+            letter-spacing=".9" fill="#f3f2f2" textLength="${Math.min(gutter - 24, e.label.length * 7.4).toFixed(0)}"
+            lengthAdjust="spacingAndGlyphs">${e.label}</text>
+        </g>`;
+      });
+    }).join("");
+  }
+  return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="xMidYMid meet">
+    <g stroke="rgba(243,242,242,.045)" stroke-width="1">${grid}</g>
+    <line x1="${gutter - 26}" y1="${h / 2}" x2="${w - gutter + 26}" y2="${h / 2}" stroke="rgba(243,242,242,.10)" stroke-width="1"/>
+    ${view.body}${dim}${pinSvg}
+  </svg>`;
+}
+
+// The viewBox is sized to the panel it lands in, so the weapon fills the
+// frame instead of letterboxing inside a fixed 2:1 box.
+function schematicInto(el, weaponIdx, atts, pins) {
+  const w = Math.max(260, Math.round(el.clientWidth || 520));
+  const h = Math.max(150, Math.round(el.clientHeight || 260));
+  el.innerHTML = weaponSchematic(weaponIdx, atts, { w, h, pins });
 }
 
 /* ---------------- lobby ---------------- */
-function initLobby() {
-  const squad = [
-    ["1", "VIPER-04", "YOU"], ["2", "HALVARD", "READY"], ["3", "SIX-TEN", "IN GUNSMITH"],
-    ["4", "MARROW", "READY"], ["5", "TALLINN", "READY"],
-  ];
-  $("lobby-squad").innerHTML = squad.map(([i, n, s]) =>
-    `<div class="squadrow"><div class="num">${i}</div><span class="nm">${n}</span><span class="st">${s}</span></div>`
-  ).join("");
+const KILL_OPTS = [25, 40, 60];
+const TIME_OPTS = [5, 8, 12];
+const SKILL_OPTS = ["RECRUIT", "REGULAR", "VETERAN"];
 
-  const nav = [["LOBBY", "lobby"], ["LOADOUT", "loadout"], ["GUNSMITH", "gunsmith"], ["STORE", null]];
+function segbar(el, opts, current, onPick, fmt = v => v) {
+  el.innerHTML = "";
+  opts.forEach((o, i) => {
+    const b = document.createElement("button");
+    b.textContent = fmt(o);
+    if (i === current) b.classList.add("on");
+    b.addEventListener("click", () => { onPick(i, o); });
+    el.appendChild(b);
+  });
+}
+
+function renderLobby() {
+  $("lobby-callsign").textContent = settings.callsign;
+  const w = WEAPONS[curWeapon()];
+  schematicInto($("kit-art"), curWeapon(), curAtts(), false);
+  $("kit-name").textContent = w.name;
+  $("kit-atts").innerHTML = ATTS.map((a, i) => {
+    const oi = curAtts()[i];
+    const cls = oi === 0 ? "tag tag-neutral" : "tag tag-outline";
+    return `<span class="${cls}">${a.opts[oi][0]}</span>`;
+  }).join("");
+  $("hero-meta").textContent =
+    `6v6 · ${settings.killTarget} KILLS · ${settings.matchMinutes} MIN · ${SKILL_OPTS[settings.botSkill]}`;
+
+  segbar($("seg-kills"), KILL_OPTS, KILL_OPTS.indexOf(settings.killTarget),
+    (i, v) => { settings.killTarget = v; saveSettings(); renderLobby(); });
+  segbar($("seg-time"), TIME_OPTS, TIME_OPTS.indexOf(settings.matchMinutes),
+    (i, v) => { settings.matchMinutes = v; saveSettings(); renderLobby(); }, v => v + " MIN");
+  segbar($("seg-skill"), SKILL_OPTS, settings.botSkill,
+    i => { settings.botSkill = i; saveSettings(); renderLobby(); });
+}
+
+function initLobby() {
+  const nav = [["LOBBY", "lobby"], ["ARMORY", "gunsmith"], ["SETTINGS", "settings"]];
   $("lobby-nav").innerHTML = "";
   for (const [label, target] of nav) {
     const b = document.createElement("button");
     b.textContent = label;
     if (target === "lobby") b.classList.add("on");
-    if (!target) b.style.opacity = 0.4;
-    b.addEventListener("click", () => { if (target) goto(target); });
+    b.addEventListener("click", () => goto(target));
     $("lobby-nav").appendChild(b);
   }
   $("btn-play").addEventListener("click", deploy);
-
-  // operator art — geometric modernist figure
-  $("op-art").innerHTML = `
-  <svg viewBox="0 0 200 260" preserveAspectRatio="xMidYMid slice">
-    <rect width="200" height="260" fill="#211f1e"/>
-    <g fill="none" stroke="rgba(243,242,242,.12)" stroke-width="1">
-      ${Array.from({ length: 6 }, (_, i) => `<line x1="${i * 40}" y1="0" x2="${i * 40}" y2="260"/>`).join("")}
-      ${Array.from({ length: 7 }, (_, i) => `<line x1="0" y1="${i * 40}" x2="200" y2="${i * 40}"/>`).join("")}
-    </g>
-    <rect x="72" y="38" width="56" height="52" fill="#3a3634"/>
-    <rect x="68" y="58" width="64" height="9" fill="#ff563c"/>
-    <rect x="58" y="96" width="84" height="88" fill="#413c3a"/>
-    <rect x="58" y="112" width="84" height="10" fill="#2b2827"/>
-    <rect x="46" y="100" width="12" height="62" fill="#353130"/>
-    <rect x="142" y="100" width="12" height="62" fill="#353130"/>
-    <rect x="70" y="184" width="24" height="60" fill="#2e2b29"/>
-    <rect x="106" y="184" width="24" height="60" fill="#2e2b29"/>
-    <rect x="94" y="140" width="52" height="12" fill="#151312"/>
-    <rect x="140" y="136" width="26" height="7" fill="#151312"/>
-    <rect x="60" y="96" width="4" height="88" fill="#ff563c" opacity=".8"/>
-  </svg>`;
+  $("lobby-callsign").addEventListener("click", () => {
+    const v = prompt("CALLSIGN", settings.callsign);
+    if (v && v.trim()) {
+      settings.callsign = v.trim().toUpperCase().slice(0, 12);
+      saveSettings();
+      renderLobby();
+    }
+  });
 }
 
-/* ---------------- loadout ---------------- */
-function renderLoadout() {
-  const cur = WEAPONS[state.weapon];
-  const slots = [
-    { kind: "PRIMARY", name: cur.name, meta: cur.origin, hint: "6 ATTACHMENTS", go: "gunsmith", sel: true },
-    { kind: "SECONDARY", name: "TR-2 SPIKE", meta: ".45 · MACHINE PISTOL", hint: "2 ATTACHMENTS", go: "gunsmith" },
-    { kind: "LETHAL", name: "FRAG ×2", meta: "3.5s FUSE", hint: "TAP TO SWAP" },
-    { kind: "TACTICAL", name: "SIGNAL SMOKE", meta: "9s BLOOM", hint: "TAP TO SWAP" },
-    { kind: "PERK LINE", name: "TRACEUR", meta: "VAULT SPEED +18%", hint: "3 SLOTS" },
-  ];
-  const cols = $("loadout-cols");
-  cols.innerHTML = "";
-  for (const s of slots) {
-    const b = document.createElement("button");
-    b.className = "slotbtn" + (s.sel ? " sel" : "");
-    b.innerHTML = `<div class="kind">${s.kind}</div><div class="nm">${s.name}</div><div class="meta">${s.meta}</div><div class="hint">${s.hint}</div>`;
-    b.addEventListener("click", () => { if (s.go) goto(s.go); });
-    cols.appendChild(b);
-  }
-}
-
-/* ---------------- gunsmith ---------------- */
-// Callouts live in the SVG's own coordinate space (viewBox 0 0 520 260) so
-// each label can be joined to the part it names by a real leader line:
-// l* = label anchor, t* = the point on the weapon it points at.
-const PIN_SETS = [
-  [ // KM-7 MERIDIAN
-    { label: "OPTIC", lx: 236, ly: 34, tx: 204, ty: 94 },
-    { label: "MUZZLE", lx: 452, ly: 74, tx: 406, ty: 126 },
-    { label: "UNDERBRL", lx: 356, ly: 226, tx: 312, ty: 164 },
-    { label: "STOCK", lx: 96, ly: 52, tx: 73, ty: 116 },
-    { label: "MAGAZINE", lx: 150, ly: 240, tx: 218, ty: 196 },
-  ],
-  [ // VZ-9 CINDER
-    { label: "OPTIC", lx: 208, ly: 44, tx: 189, ty: 104 },
-    { label: "MUZZLE", lx: 424, ly: 88, tx: 369, ty: 128 },
-    { label: "GRIP", lx: 96, ly: 232, tx: 163, ty: 196 },
-    { label: "STOCK", lx: 112, ly: 58, tx: 94, ty: 122 },
-    { label: "MAGAZINE", lx: 236, ly: 236, tx: 206, ty: 192 },
-  ],
-  [ // LR-13 OBELISK
-    { label: "OPTIC", lx: 262, ly: 36, tx: 231, ty: 96 },
-    { label: "MUZZLE", lx: 430, ly: 62, tx: 451, ty: 108 },
-    { label: "BIPOD", lx: 392, ly: 226, tx: 335, ty: 162 },
-    { label: "STOCK", lx: 92, ly: 52, tx: 63, ty: 112 },
-    { label: "MAGAZINE", lx: 168, ly: 240, tx: 227, ty: 196 },
-  ],
-  [ // AM-50 BASILISK
-    { label: "OPTIC", lx: 250, ly: 30, tx: 226, ty: 84 },
-    { label: "MUZZLE BRAKE", lx: 452, ly: 76, tx: 470, ty: 116 },
-    { label: "BIPOD", lx: 380, ly: 232, tx: 330, ty: 170 },
-    { label: "STOCK", lx: 88, ly: 50, tx: 58, ty: 112 },
-    { label: "MAGAZINE", lx: 150, ly: 240, tx: 214, ty: 200 },
-  ],
-];
-
-function weaponSvg(idx) {
-  // honest schematic silhouettes per class — receiver/barrel/mag/stock blocks
-  const acc = "#ff563c";
-  const ink = "#3d3835", dark = "#2b2827", mid = "#4b4644";
-  if (idx === 1) return `
-    <rect x="120" y="118" width="150" height="34" fill="${ink}"/>
-    <rect x="264" y="124" width="90" height="18" fill="${mid}"/>
-    <rect x="352" y="128" width="34" height="10" fill="${dark}"/>
-    <rect x="150" y="150" width="26" height="58" fill="${dark}" transform="skewX(-8)"/>
-    <rect x="196" y="150" width="20" height="44" fill="${ink}"/>
-    <rect x="66" y="122" width="56" height="22" fill="${dark}"/>
-    <rect x="168" y="104" width="42" height="16" fill="${dark}"/>
-    <rect x="182" y="98" width="6" height="8" fill="${acc}"/>`;
-  if (idx === 2) return `
-    <rect x="90" y="120" width="210" height="26" fill="${ink}"/>
-    <rect x="292" y="112" width="150" height="14" fill="${mid}"/>
-    <rect x="436" y="108" width="30" height="22" fill="${dark}"/>
-    <rect x="150" y="144" width="18" height="70" fill="${dark}"/>
-    <rect x="216" y="144" width="22" height="52" fill="${ink}" transform="skewX(-6)"/>
-    <rect x="34" y="112" width="58" height="34" fill="${dark}"/>
-    <rect x="34" y="124" width="58" height="4" fill="${acc}"/>
-    <rect x="196" y="96" width="70" height="20" fill="${dark}"/>
-    <rect x="226" y="90" width="8" height="8" fill="${acc}"/>
-    <rect x="300" y="132" width="70" height="30" fill="${dark}"/>`;
-  if (idx === 3) return `
-    <rect x="86" y="106" width="210" height="42" fill="${ink}"/>
-    <rect x="288" y="116" width="176" height="20" fill="${mid}"/>
-    <rect x="456" y="110" width="34" height="32" fill="${dark}"/>
-    <rect x="456" y="122" width="34" height="6" fill="${acc}"/>
-    <rect x="146" y="150" width="26" height="70" fill="${dark}" transform="skewX(-8)"/>
-    <rect x="200" y="150" width="26" height="54" fill="${ink}" transform="skewX(-4)"/>
-    <rect x="28" y="104" width="60" height="40" fill="${dark}"/>
-    <rect x="28" y="120" width="60" height="6" fill="${acc}"/>
-    <rect x="188" y="80" width="82" height="24" fill="${dark}"/>
-    <rect x="222" y="70" width="10" height="12" fill="${acc}"/>
-    <rect x="300" y="140" width="64" height="34" fill="${dark}"/>`;
-  return `
-    <rect x="100" y="112" width="180" height="38" fill="${ink}"/>
-    <rect x="272" y="120" width="120" height="20" fill="${mid}"/>
-    <rect x="386" y="124" width="40" height="12" fill="${dark}"/>
-    <rect x="140" y="148" width="28" height="62" fill="${dark}" transform="skewX(-8)"/>
-    <rect x="206" y="148" width="24" height="52" fill="${ink}" transform="skewX(-4)"/>
-    <rect x="44" y="116" width="58" height="30" fill="${dark}"/>
-    <rect x="44" y="128" width="58" height="5" fill="${acc}"/>
-    <rect x="176" y="94" width="56" height="20" fill="${dark}"/>
-    <rect x="198" y="86" width="8" height="10" fill="${acc}"/>
-    <rect x="286" y="138" width="52" height="26" fill="${dark}"/>`;
-}
-
-// Leader line + marker + label for one callout, drawn in SVG space.
-function pinSvg(p) {
-  const right = p.lx > p.tx;
-  const anchor = right ? "start" : "end";
-  const stubX = p.lx + (right ? 10 : -10);
-  return `<g class="pin-g">
-    <polyline points="${p.tx},${p.ty} ${p.lx},${p.ly} ${stubX},${p.ly}"
-      fill="none" stroke="#ff563c" stroke-width="1.5" opacity=".85"/>
-    <rect x="${p.tx - 3.5}" y="${p.ty - 3.5}" width="7" height="7" fill="#ff563c"/>
-    <text x="${stubX + (right ? 4 : -4)}" y="${p.ly + 3.5}" text-anchor="${anchor}"
-      font-family="Archivo,sans-serif" font-size="11" font-weight="800"
-      letter-spacing="1.2" fill="#f3f2f2">${p.label}</text>
-  </g>`;
-}
-
+/* ---------------- armory ---------------- */
 function renderGunsmith() {
-  const w = WEAPONS[state.weapon];
-  // armory list
+  const wi = curWeapon(), atts = curAtts();
+  const w = WEAPONS[wi];
+
   const list = $("gs-weapons");
   list.innerHTML = "";
   WEAPONS.forEach((wp, i) => {
     const b = document.createElement("button");
-    b.className = "wbtn" + (i === state.weapon ? " sel" : "");
-    b.innerHTML = `<div class="cls">${wp.cls}</div><div class="nm">${wp.name}</div><div class="lv">LVL ${wp.lvl} · 6 ATT</div>`;
-    b.addEventListener("click", () => { state.weapon = i; renderGunsmith(); });
+    b.className = "wbtn" + (i === wi ? " sel" : "");
+    b.innerHTML = `<div class="cls">${wp.cls}</div><div class="nm">${wp.name}</div><div class="lv">${wp.origin}</div>`;
+    b.addEventListener("click", () => {
+      settings.loadout.weapon = i;
+      saveSettings();
+      renderGunsmith();
+    });
     list.appendChild(b);
   });
 
   $("gs-name").textContent = w.name;
-  $("gs-sub").textContent = `${w.cls} · ${w.origin}`;
+  $("gs-sub").textContent = w.origin;
+  $("gs-real").textContent = "ANALOGUE · " + w.real;
   $("gs-note").textContent = w.note;
+  schematicInto($("gs-stage"), wi, atts, true);
 
-  // stage
-  $("gs-stage").innerHTML = `
-    <svg viewBox="0 0 520 260" preserveAspectRatio="xMidYMid meet">
-      <line x1="0" y1="122" x2="520" y2="122" stroke="rgba(243,242,242,.16)" stroke-width="1"/>
-      ${weaponSvg(state.weapon)}
-      ${(PIN_SETS[state.weapon] || PIN_SETS[0]).map(pinSvg).join("")}
-    </svg>`;
-
-  // attachment slots
-  const atts = $("gs-atts");
-  atts.innerHTML = "";
+  const atEl = $("gs-atts");
+  atEl.innerHTML = "";
   ATTS.forEach((a, ai) => {
-    const oi = state.atts[ai];
+    const oi = atts[ai];
     const b = document.createElement("button");
     b.className = "attbtn" + (oi !== 0 ? " on" : "");
     b.innerHTML = `<div class="kind">${a.kind}</div><div class="nm">${a.opts[oi][0]}</div>`;
     b.addEventListener("click", () => {
-      state.atts[ai] = (state.atts[ai] + 1) % a.opts.length;
+      atts[ai] = (atts[ai] + 1) % a.opts.length;
+      saveSettings();
       renderGunsmith();
     });
-    atts.appendChild(b);
+    atEl.appendChild(b);
   });
 
-  // stats
-  const st = statsFor(state.weapon, state.atts);
+  const st = statsFor(wi, atts);
   $("gs-stats").innerHTML = STAT_NAMES.map((n, i) => {
     const s = st[i];
     const arrow = s.d ? (s.d > 0 ? " ▲" : " ▼") : "";
@@ -336,19 +330,254 @@ function renderGunsmith() {
   }).join("");
 }
 
+/* ---------------- settings screen ---------------- */
+const SETTINGS_SPEC = [
+  {
+    group: "DISPLAY", rows: [
+      { t: "range", k: "hudScale", label: "HUD SCALE", min: 0.7, max: 1.4, step: 0.02, fmt: v => Math.round(v * 100) + "%" },
+      { t: "range", k: "hudAlpha", label: "HUD OPACITY", min: 0.3, max: 1, step: 0.02, fmt: v => Math.round(v * 100) + "%" },
+      { t: "range", k: "fov", label: "FIELD OF VIEW", min: 62, max: 100, step: 1, fmt: v => Math.round(v) + "°" },
+      { t: "range", k: "shake", label: "CAMERA SHAKE", min: 0, max: 1.6, step: 0.05, fmt: v => Math.round(v * 100) + "%" },
+    ],
+  },
+  {
+    group: "CONTROLS", rows: [
+      { t: "range", k: "sens", label: "LOOK SENSITIVITY", min: 0.3, max: 2.4, step: 0.05, fmt: v => v.toFixed(2) + "×" },
+      { t: "range", k: "adsSens", label: "ADS SENSITIVITY", min: 0.2, max: 1.6, step: 0.05, fmt: v => v.toFixed(2) + "×" },
+      { t: "range", k: "aimAssist", label: "AIM ASSIST", min: 0, max: 1, step: 0.05, fmt: v => v === 0 ? "OFF" : Math.round(v * 100) + "%" },
+      { t: "toggle", k: "invertY", label: "INVERT LOOK Y" },
+      { t: "toggle", k: "southpaw", label: "SOUTHPAW (MIRROR)" },
+      { t: "toggle", k: "autoSprint", label: "AUTO SPRINT" },
+    ],
+  },
+  {
+    group: "RETICLE", rows: [
+      { t: "range", k: "crosshair.size", label: "CROSSHAIR LENGTH", min: 0.5, max: 2, step: 0.05, fmt: v => v.toFixed(2) + "×" },
+      { t: "range", k: "crosshair.gap", label: "CROSSHAIR GAP", min: 0, max: 2.5, step: 0.05, fmt: v => v.toFixed(2) + "×" },
+      { t: "toggle", k: "crosshair.dot", label: "CENTER DOT" },
+    ],
+  },
+  {
+    group: "HUD ELEMENTS", rows: [
+      { t: "toggle", k: "show.score", label: "SCORE / CLOCK" },
+      { t: "toggle", k: "show.minimap", label: "MINIMAP" },
+      { t: "toggle", k: "show.compass", label: "COMPASS" },
+      { t: "toggle", k: "show.killfeed", label: "KILL FEED" },
+      { t: "toggle", k: "show.ammo", label: "AMMO COUNTER" },
+      { t: "toggle", k: "show.vitals", label: "HEALTH / STANCE" },
+      { t: "toggle", k: "show.prompt", label: "STATUS LINE" },
+      { t: "toggle", k: "show.stanceBtn", label: "STANCE BUTTON" },
+      { t: "toggle", k: "show.fps", label: "FPS COUNTER" },
+    ],
+  },
+  {
+    group: "AUDIO & FEEDBACK", rows: [
+      { t: "range", k: "volume", label: "MASTER VOLUME", min: 0, max: 1, step: 0.02, fmt: v => Math.round(v * 100) + "%" },
+      { t: "toggle", k: "wastedSting", label: "DOWNED STING" },
+      { t: "toggle", k: "killcam", label: "FINAL KILL CAM" },
+    ],
+  },
+  {
+    group: "IDENTITY", rows: [
+      { t: "text", k: "callsign", label: "CALLSIGN" },
+    ],
+  },
+];
+
+const getPath = (o, p) => p.split(".").reduce((a, k) => a?.[k], o);
+function setPath(o, p, v) {
+  const parts = p.split(".");
+  const last = parts.pop();
+  parts.reduce((a, k) => a[k], o)[last] = v;
+}
+
+function renderSettings() {
+  const host = $("set-scroll");
+  host.innerHTML = "";
+  for (const g of SETTINGS_SPEC) {
+    const sec = document.createElement("div");
+    sec.className = "setgroup";
+    sec.innerHTML = `<div class="gh">${g.group}</div>`;
+    for (const row of g.rows) {
+      if (row.t === "range") {
+        const wrap = document.createElement("div");
+        wrap.className = "setrow";
+        const val = getPath(settings, row.k);
+        wrap.innerHTML = `<div class="r1"><span class="nm">${row.label}</span><span class="val">${row.fmt(val)}</span></div>`;
+        const input = document.createElement("input");
+        input.type = "range";
+        input.min = row.min; input.max = row.max; input.step = row.step; input.value = val;
+        input.addEventListener("input", () => {
+          const v = parseFloat(input.value);
+          setPath(settings, row.k, v);
+          wrap.querySelector(".val").textContent = row.fmt(v);
+          applyHud();
+          state.game?.applySettings?.();
+        });
+        input.addEventListener("change", saveSettings);
+        wrap.appendChild(input);
+        sec.appendChild(wrap);
+      } else if (row.t === "toggle") {
+        const b = document.createElement("button");
+        b.className = "toggle" + (getPath(settings, row.k) ? " on" : "");
+        b.innerHTML = `<span>${row.label}</span><span class="sw"></span>`;
+        b.addEventListener("click", () => {
+          const v = !getPath(settings, row.k);
+          setPath(settings, row.k, v);
+          b.classList.toggle("on", v);
+          saveSettings();
+          applyHud();
+          state.game?.applySettings?.();
+        });
+        sec.appendChild(b);
+      } else if (row.t === "text") {
+        const wrap = document.createElement("div");
+        wrap.className = "setrow";
+        wrap.innerHTML = `<div class="r1"><span class="nm">${row.label}</span></div>`;
+        const input = document.createElement("input");
+        input.id = "set-callsign";
+        input.value = settings.callsign;
+        input.maxLength = 12;
+        input.addEventListener("change", () => {
+          settings.callsign = (input.value || "VIPER-04").toUpperCase().slice(0, 12);
+          input.value = settings.callsign;
+          saveSettings();
+        });
+        wrap.appendChild(input);
+        sec.appendChild(wrap);
+      }
+    }
+    host.appendChild(sec);
+  }
+}
+
+/* ---------------- HUD layout editor ----------------
+   The HUD is plain DOM, so "customizable and resizable" is a drag plus a
+   scale factor per control, written straight into the saved layout map. */
+const editor = { on: false, sel: null, drag: null, returnTo: "settings" };
+
+function openLayoutEditor(returnTo = "settings") {
+  editor.on = true;
+  editor.returnTo = returnTo;
+  editor.sel = null;
+  showScreen("hud");
+  document.body.classList.add("layout-edit");
+  $("edit-bar").classList.add("active");
+  $("edit-sel").textContent = "SELECT A CONTROL";
+  $("edit-size").disabled = true;
+  // sample content so empty panels are still grabbable
+  if (!$("killfeed").children.length) {
+    $("killfeed").innerHTML = `<div class="feedrow"><span>${settings.callsign}</span><span class="x">✕</span><span class="b">KOR-11</span></div>`;
+  }
+  if (!$("compass-strip").children.length) {
+    $("compass-strip").innerHTML = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+      .map(s => `<span class="${s.length === 1 ? "card" : ""}">${s}</span>`).join("");
+  }
+  for (const spec of HUD_ELEMENTS) {
+    const el = $(spec.id);
+    if (!el) continue;
+    el.classList.add("editable");
+    el.classList.remove("hud-off");
+    el.addEventListener("pointerdown", onEditDown);
+  }
+}
+
+function closeLayoutEditor() {
+  editor.on = false;
+  document.body.classList.remove("layout-edit");
+  $("edit-bar").classList.remove("active");
+  for (const spec of HUD_ELEMENTS) {
+    const el = $(spec.id);
+    if (!el) continue;
+    el.classList.remove("editable", "sel");
+    el.removeEventListener("pointerdown", onEditDown);
+  }
+  applyHud();
+  saveSettings();
+  goto(editor.returnTo);
+}
+
+function selectEditable(id) {
+  editor.sel = id;
+  for (const spec of HUD_ELEMENTS) $(spec.id)?.classList.toggle("sel", spec.id === id);
+  const spec = HUD_ELEMENTS.find(s => s.id === id);
+  const e = captureLayout(id);
+  $("edit-sel").textContent = spec.label;
+  const sl = $("edit-size");
+  sl.disabled = false;
+  sl.min = spec.min; sl.max = spec.max;
+  sl.value = e.s ?? 1;
+}
+
+function onEditDown(ev) {
+  if (!editor.on) return;
+  ev.preventDefault();
+  ev.stopPropagation();
+  const el = ev.currentTarget;
+  selectEditable(el.id);
+  const e = captureLayout(el.id);
+  const r = el.getBoundingClientRect();
+  editor.drag = {
+    id: el.id, pointer: ev.pointerId,
+    dx: ev.clientX - r.left, dy: ev.clientY - r.top,
+    w: r.width, h: r.height,
+  };
+  try { el.setPointerCapture(ev.pointerId); } catch { /* gone */ }
+}
+
+function onEditMove(ev) {
+  const d = editor.drag;
+  if (!d || ev.pointerId !== d.pointer) return;
+  const W = window.innerWidth, H = window.innerHeight;
+  const x = Math.max(0, Math.min(W - d.w, ev.clientX - d.dx));
+  const y = Math.max(0, Math.min(H - d.h, ev.clientY - d.dy));
+  const e = settings.layout[d.id];
+  e.x = x / W; e.y = y / H;
+  applyLayout();
+}
+
+function onEditUp(ev) {
+  if (editor.drag && ev.pointerId === editor.drag.pointer) {
+    editor.drag = null;
+    saveSettings();
+  }
+}
+
+function initLayoutEditor() {
+  window.addEventListener("pointermove", onEditMove);
+  window.addEventListener("pointerup", onEditUp);
+  window.addEventListener("pointercancel", onEditUp);
+  $("edit-size").addEventListener("input", () => {
+    if (!editor.sel) return;
+    const e = captureLayout(editor.sel);
+    e.s = parseFloat($("edit-size").value);
+    applyLayout();
+  });
+  $("edit-size").addEventListener("change", saveSettings);
+  $("edit-reset").addEventListener("click", () => {
+    resetLayout();
+    editor.sel = null;
+    $("edit-sel").textContent = "SELECT A CONTROL";
+    $("edit-size").disabled = true;
+    for (const spec of HUD_ELEMENTS) $(spec.id)?.classList.remove("sel");
+  });
+  $("edit-done").addEventListener("click", closeLayoutEditor);
+}
+
 /* ---------------- navigation ---------------- */
 function goto(name) {
-  if (name === "loadout") renderLoadout();
-  if (name === "gunsmith") renderGunsmith();
+  // show first: the schematics size their viewBox off the live panel, which
+  // only has a box once the screen is displayed
   showScreen(name);
+  if (name === "lobby") renderLobby();
+  if (name === "gunsmith") renderGunsmith();
+  if (name === "settings") renderSettings();
   if (name === "lobby") {
     document.querySelectorAll("#lobby-nav button").forEach((b, i) => b.classList.toggle("on", i === 0));
   }
 }
 
 /* ---------------- match flow ---------------- */
-// On Android, go fullscreen + lock landscape from the PLAY gesture.
-// Both calls are best-effort; desktop browsers just ignore the lock.
 async function goImmersive() {
   try {
     if (!document.fullscreenElement && document.documentElement.requestFullscreen) {
@@ -360,20 +589,23 @@ async function goImmersive() {
 
 function deploy() {
   goImmersive();
+  MATCH.killTarget = settings.killTarget;
+  MATCH.timeLimit = settings.matchMinutes * 60;
   runBoot("deploy", startMatch);
 }
 
 function startMatch() {
-  const loadout = buildLoadout(state.weapon, state.atts);
+  const loadout = buildLoadout(curWeapon(), curAtts());
   showScreen("hud");
+  applyHud();
   $("overlay-end").classList.remove("active");
   $("overlay-pause").classList.remove("active");
-  // sentinel history entry: Android's back gesture pops this (and pauses via
-  // the popstate listener) instead of unloading the page mid-match
   if (history.state?.inMatch !== 1) history.pushState({ inMatch: 1 }, "");
   state.game = new Game({
     canvas: $("gl"),
     loadout,
+    playerName: settings.callsign,
+    skill: settings.botSkill,
     onEnd: showMatchEnd,
   });
   state.game.start();
@@ -408,8 +640,28 @@ function initOverlays() {
   });
   $("btn-resume").addEventListener("click", () => {
     $("overlay-pause").classList.remove("active");
-    goImmersive(); // valid user gesture: restore fullscreen + landscape lock
+    goImmersive();
     state.game?.setPaused(false);
+  });
+  // settings mid-match: the game stays paused underneath and BACK returns to it
+  $("btn-settings-match").addEventListener("click", () => {
+    $("overlay-pause").classList.remove("active");
+    renderSettings();
+    showScreen("settings");
+  });
+  $("set-back").addEventListener("click", () => {
+    if (state.game && !state.game.over) {
+      showScreen("hud");
+      $("overlay-pause").classList.add("active");
+    } else {
+      goto("lobby");
+    }
+  });
+  $("set-layout").addEventListener("click", () => openLayoutEditor("settings"));
+  $("set-reset").addEventListener("click", () => {
+    resetSettings();
+    renderSettings();
+    state.game?.applySettings?.();
   });
   $("btn-abandon").addEventListener("click", () => {
     $("overlay-pause").classList.remove("active");
@@ -427,26 +679,29 @@ function initOverlays() {
     endGame();
     goto("lobby");
   });
+  $("boot-skip").addEventListener("click", () => { state.bootDone?.(); });
+
   window.addEventListener("keydown", e => {
-    if (e.code === "Escape" && state.game && !state.game.over) {
-      const pauseOpen = $("overlay-pause").classList.contains("active");
-      if (pauseOpen) { $("overlay-pause").classList.remove("active"); state.game.setPaused(false); }
-      else { state.game.setPaused(true); $("overlay-pause").classList.add("active"); }
+    if (e.code === "Escape") {
+      if (editor.on) { closeLayoutEditor(); return; }
+      if (state.game && !state.game.over) {
+        const pauseOpen = $("overlay-pause").classList.contains("active");
+        if (pauseOpen) { $("overlay-pause").classList.remove("active"); state.game.setPaused(false); }
+        else { state.game.setPaused(true); $("overlay-pause").classList.add("active"); }
+      }
     }
   });
 
   const pauseMatch = () => {
-    if (state.game && !state.game.over && !state.game.paused) {
+    if (state.game && !state.game.over && !state.game.paused && state.screen === "hud") {
       state.game.setPaused(true);
       $("overlay-pause").classList.add("active");
     }
   };
-  // Android back gesture: swallow the pop, re-arm the sentinel, pause
   window.addEventListener("popstate", () => {
     if (!state.game) return;
     history.pushState({ inMatch: 1 }, "");
     if (state.game.over) {
-      // match already finished: back always returns to the lobby
       $("overlay-end").classList.remove("active");
       endGame();
       goto("lobby");
@@ -457,32 +712,31 @@ function initOverlays() {
   window.addEventListener("beforeunload", e => {
     if (state.game && !state.game.over) { e.preventDefault(); e.returnValue = ""; }
   });
-  // losing fullscreen (back swipe, shade pull) or rotating to portrait
-  // releases the orientation lock — pause instead of playing blind
   document.addEventListener("fullscreenchange", () => {
     if (!document.fullscreenElement) pauseMatch();
   });
   matchMedia("(orientation: portrait)").addEventListener("change", e => {
     if (e.matches) pauseMatch();
   });
-}
-
-/* ---------------- misc ---------------- */
-function tickClock() {
-  const d = new Date();
-  $("clock-real").textContent =
-    `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  window.addEventListener("resize", () => { if (editor.on) applyLayout(); });
 }
 
 /* ---------------- init ---------------- */
+applyHud();
 initLobby();
 initOverlays();
-$("lo-back").addEventListener("click", () => goto("lobby"));
-$("lo-gunsmith").addEventListener("click", () => goto("gunsmith"));
-$("lo-deploy").addEventListener("click", deploy);
-$("gs-back").addEventListener("click", () => goto("loadout"));
+initLayoutEditor();
+$("gs-back").addEventListener("click", () => goto("lobby"));
 $("gs-deploy").addEventListener("click", deploy);
-tickClock();
-setInterval(tickClock, 20000);
+fillSystemInfo();
 
-runBoot("cold", () => goto("lobby"));
+// #lobby / #armory / #settings / #play jump straight to a screen after boot —
+// used for QA captures and for deep links back into the app
+function afterBoot() {
+  const [h, arg] = (location.hash || "").replace("#", "").split(":");
+  if (arg !== undefined && WEAPONS[+arg]) settings.loadout.weapon = +arg;
+  if (h === "play") { deploy(); return; }
+  goto({ armory: "gunsmith", settings: "settings", lobby: "lobby" }[h] || "lobby");
+}
+
+runBoot("cold", afterBoot);

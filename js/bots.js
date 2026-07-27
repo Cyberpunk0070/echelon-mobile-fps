@@ -11,22 +11,22 @@ const AIM_CONE = 0.13;          // rad — must face target this closely to shoo
    flanker takes wide routes, an anchor holds ground and suppresses. */
 const ARCHETYPES = [
   {
-    name: "RUSHER", weight: 3,
+    name: "RUSHER", weapon: "VZ-9 CINDER", weight: 3,
     speed: 5.2, sprint: 1.34, turn: 6.6, view: 52, fireRange: 30, idealMin: 3, idealMax: 14,
     rpm: 820, dmg: 9, burst: [5, 9], pause: [0.24, 0.55], react: [0.16, 0.30], acc: 0.74, strafe: 1.5,
   },
   {
-    name: "MARKSMAN", weight: 2,
+    name: "MARKSMAN", weapon: "LR-13 OBELISK", weight: 2,
     speed: 3.5, sprint: 1.15, turn: 4.4, view: 78, fireRange: 74, idealMin: 26, idealMax: 55,
     rpm: 260, dmg: 26, burst: [1, 2], pause: [0.75, 1.35], react: [0.30, 0.62], acc: 0.9, strafe: 0.5,
   },
   {
-    name: "FLANKER", weight: 3,
+    name: "FLANKER", weapon: "VZ-9 CINDER", weight: 3,
     speed: 4.8, sprint: 1.3, turn: 5.8, view: 58, fireRange: 40, idealMin: 6, idealMax: 22,
     rpm: 700, dmg: 11, burst: [4, 7], pause: [0.35, 0.7], react: [0.20, 0.38], acc: 0.78, strafe: 1.35,
   },
   {
-    name: "ANCHOR", weight: 2,
+    name: "ANCHOR", weapon: "KM-7 MERIDIAN", weight: 2,
     speed: 4.0, sprint: 1.2, turn: 5.0, view: 62, fireRange: 52, idealMin: 12, idealMax: 34,
     rpm: 600, dmg: 14, burst: [3, 6], pause: [0.45, 0.9], react: [0.24, 0.46], acc: 0.82, strafe: 0.9,
   },
@@ -145,7 +145,7 @@ export class Bot {
     if (visible) {
       if (this.reactT > 0) this.reactT -= dt;
     } else {
-      this.reactT = rand(a.react[0], a.react[1]) * (1 - 0.45 * esc);
+      this.reactT = rand(a.react[0], a.react[1]) * (1 - 0.45 * esc) / (ctx.skill ?? 1);
     }
 
     // --- decide desired movement ---
@@ -277,26 +277,30 @@ export class Bot {
   }
 
   canSee(e, ctx) {
+    // aim at the target's actual chest height — a prone player presents a
+    // silhouette barely off the deck, and the sight line has to agree
     return !ctx.world.losBlocked(
       this.pos.x, this.pos.y + 1.55, this.pos.z,
-      e.pos.x, e.pos.y + 1.15, e.pos.z
+      e.pos.x, e.pos.y + (e.chestY ?? 1.15), e.pos.z
     );
   }
 
   fireAt(t, dist, ctx, esc = 0) {
     // accuracy: archetype skill, range falloff, target and self motion,
-    // all sharpened as the match escalates
+    // all sharpened as the match escalates and scaled by the chosen difficulty
     const a = this.arch;
+    const skill = ctx.skill ?? 1;
     const targetSpeed = t.isPlayer ? (t.speedVal || 0) : t.moving;
     const rangeFactor = Math.max(0, dist - a.idealMax) * 0.012;
-    let p = a.acc * (0.82 + 0.3 * esc)
+    let p = a.acc * (0.82 + 0.3 * esc) * skill
       - rangeFactor
       - targetSpeed * 0.038
       - this.moving * 0.028;
-    if (t.isPlayer && t.crouching) p -= 0.05;   // smaller silhouette
+    // a lower silhouette is harder to hit; prone most of all
+    if (t.isPlayer) p -= [0, 0.06, 0.15][t.stance ?? 0];
     p = Math.max(0.05, Math.min(0.92, p));
     const hit = Math.random() < p;
-    const dmg = this.dmg * (0.85 + Math.random() * 0.3) * (1 + 0.25 * esc);
+    const dmg = this.dmg * (0.85 + Math.random() * 0.3) * (1 + 0.25 * esc) * skill;
     ctx.events.onBotShot(this, t, hit, hit ? dmg : 0);
   }
 }

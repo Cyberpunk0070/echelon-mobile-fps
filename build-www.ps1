@@ -6,4 +6,5 @@ New-Item -ItemType Directory $www | Out-Null
 Copy-Item (Join-Path $root "index.html") $www
 Copy-Item (Join-Path $root "js") (Join-Path $www "js") -Recurse
 Copy-Item (Join-Path $root "fonts") (Join-Path $www "fonts") -Recurse
+Copy-Item (Join-Path $root "assets") (Join-Path $www "assets") -Recurse
 Write-Output "www assembled: $((Get-ChildItem $www -Recurse -File | Measure-Object Length -Sum).Sum) bytes"
