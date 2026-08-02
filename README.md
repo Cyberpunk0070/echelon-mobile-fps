@@ -48,7 +48,7 @@ Every menu on the front end does something. There is no season pass, no store, n
 |---|---|
 | **Mode** | 6v6 team deathmatch |
 | **Map** | Ravenglass Dockyard, 2.1 km² |
-| **Weapons** | 5 · 6 attachment slots each |
+| **Weapons** | 6 · 6 attachment slots each |
 | **Stances** | stand · crouch · prone |
 | **Enemies** | 4 AI archetypes, 3 skill tiers |
 | **Target** | configurable, 25–60 kills |
@@ -103,7 +103,7 @@ Every menu on the front end does something. There is no season pass, no store, n
 
 ## The armory
 
-Five weapons, each a rough depiction of a real service firearm. The geometry is described once and consumed twice — merged into the 3D viewmodel you carry, and projected onto the ZY plane for the menu schematic. **The diagram in the armory is a real orthographic side view of the gun in your hands**, down to the printed overall length, because it is drawn from the same part list.
+Six weapons, each a rough depiction of a real service firearm. The geometry is described once and consumed twice — merged into the 3D viewmodel you carry, and projected onto the ZY plane for the menu schematic. **The diagram in the armory is a real orthographic side view of the gun in your hands**, down to the printed overall length, because it is drawn from the same part list.
 
 | | Class | Cartridge | Analogue |
 |:--|:--|:--|:--|
@@ -112,6 +112,7 @@ Five weapons, each a rough depiction of a real service firearm. The geometry is 
 | **PK-74 VOSTOK** | Battle rifle | 7.62×39 · 600 RPM | AKM-pattern long-stroke piston rifle |
 | **LR-13 OBELISK** | Marksman rifle | 7.62×51 NATO · 260 RPM | AR-10 pattern semi-automatic DMR |
 | **AM-50 BASILISK** | Anti-materiel rifle | .50 BMG · 55 RPM | M82-pattern short-recoil rifle |
+| **GX-60 HELLSPIN** | Rotary LMG | 7.62×51 · 1400 RPM | Electrically driven six-barrel gatling |
 
 Attachments are not stat multipliers with a label. Fitting a suppressor puts a can on the barrel and changes the report; the CQB barrel shortens the handguard and pulls the gas block back; the extended magazine grows the AK's banana curve by two more segments. Optic choice moves the sight line, and **ADS aligns that sight line to the camera axis** — which is why the red dot sits exactly on the reticle when the aim finishes.
 

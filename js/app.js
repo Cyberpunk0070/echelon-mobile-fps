@@ -10,7 +10,7 @@ import {
 } from "./settings.js";
 import { describeWeapon, sideViewSvg, attKeys } from "./weapons3d.js";
 
-const BUILD = "5.1.0";
+const BUILD = "5.2.0";
 const $ = id => document.getElementById(id);
 const state = { screen: "boot", game: null, bootDone: null };
 
@@ -145,9 +145,19 @@ function fillSystemInfo() {
 }
 
 /* ---------------- weapon schematic ---------------- */
+// Cache SVG by weapon + atts + panel size so cycling attachments does not
+// rebuild geometry descriptions from scratch every click.
+const schematicCache = new Map();
+const schemKey = (weaponIdx, atts, w, h, pins) =>
+  `${weaponIdx}|${atts.join(",")}|${w}x${h}|${pins ? 1 : 0}`;
+
 // Side elevation of the exact build the player is carrying, with leader lines
 // drawn to real part positions rather than hand-placed coordinates.
 function weaponSchematic(weaponIdx, atts, { w = 520, h = 260, pins = true } = {}) {
+  const key = schemKey(weaponIdx, atts, w, h, pins);
+  const hit = schematicCache.get(key);
+  if (hit) return hit;
+
   const spec = describeWeapon(WEAPONS[weaponIdx].model, attKeys(ATTS, atts));
   const gutter = pins ? Math.min(132, Math.max(96, w * 0.16)) : 18;
   const view = sideViewSvg(spec, { w, h, padX: gutter, padY: pins ? 26 : 16 });
@@ -204,19 +214,27 @@ function weaponSchematic(weaponIdx, atts, { w = 520, h = 260, pins = true } = {}
       });
     }).join("");
   }
-  return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="xMidYMid meet">
+  const svg = `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="xMidYMid meet">
     <g stroke="rgba(243,242,242,.045)" stroke-width="1">${grid}</g>
     <line x1="${gutter - 26}" y1="${h / 2}" x2="${w - gutter + 26}" y2="${h / 2}" stroke="rgba(243,242,242,.10)" stroke-width="1"/>
     ${view.body}${dim}${pinSvg}
   </svg>`;
+  if (schematicCache.size > 48) schematicCache.clear();
+  schematicCache.set(key, svg);
+  return svg;
 }
 
 // The viewBox is sized to the panel it lands in, so the weapon fills the
 // frame instead of letterboxing inside a fixed 2:1 box.
-function schematicInto(el, weaponIdx, atts, pins) {
+function schematicInto(el, weaponIdx, atts, pins, { animate = false } = {}) {
   const w = Math.max(260, Math.round(el.clientWidth || 520));
   const h = Math.max(150, Math.round(el.clientHeight || 260));
   el.innerHTML = weaponSchematic(weaponIdx, atts, { w, h, pins });
+  if (animate) {
+    el.classList.remove("fade");
+    void el.offsetWidth;
+    el.classList.add("fade");
+  }
 }
 
 /* ---------------- lobby ---------------- */
@@ -278,45 +296,30 @@ function initLobby() {
 }
 
 /* ---------------- armory ---------------- */
-function renderGunsmith() {
-  const wi = curWeapon(), atts = curAtts();
-  const w = WEAPONS[wi];
+let _gsListBuilt = false;
+let _gsLastWeapon = -1;
 
+function ensureGunsmithList() {
   const list = $("gs-weapons");
+  if (_gsListBuilt && list.children.length === WEAPONS.length) return;
   list.innerHTML = "";
   WEAPONS.forEach((wp, i) => {
     const b = document.createElement("button");
-    b.className = "wbtn" + (i === wi ? " sel" : "");
-    b.innerHTML = `<div class="cls">${wp.cls}</div><div class="nm">${wp.name}</div><div class="lv">${wp.origin}</div>`;
+    b.className = "wbtn";
+    b.dataset.idx = String(i);
+    b.innerHTML = `<div class="cls">${wp.cls}</div><div class="nm">${wp.name}</div><div class="meta">${wp.origin}</div>`;
     b.addEventListener("click", () => {
+      if (settings.loadout.weapon === i) return;
       settings.loadout.weapon = i;
       saveSettings();
-      renderGunsmith();
+      renderGunsmith({ weaponChanged: true });
     });
     list.appendChild(b);
   });
+  _gsListBuilt = true;
+}
 
-  $("gs-name").textContent = w.name;
-  $("gs-sub").textContent = w.origin;
-  $("gs-real").textContent = "ANALOGUE · " + w.real;
-  $("gs-note").textContent = w.note;
-  schematicInto($("gs-stage"), wi, atts, true);
-
-  const atEl = $("gs-atts");
-  atEl.innerHTML = "";
-  ATTS.forEach((a, ai) => {
-    const oi = atts[ai];
-    const b = document.createElement("button");
-    b.className = "attbtn" + (oi !== 0 ? " on" : "");
-    b.innerHTML = `<div class="kind">${a.kind}</div><div class="nm">${a.opts[oi][0]}</div>`;
-    b.addEventListener("click", () => {
-      atts[ai] = (atts[ai] + 1) % a.opts.length;
-      saveSettings();
-      renderGunsmith();
-    });
-    atEl.appendChild(b);
-  });
-
+function renderGunsmithStats(wi, atts) {
   const st = statsFor(wi, atts);
   $("gs-stats").innerHTML = STAT_NAMES.map((n, i) => {
     const s = st[i];
@@ -328,6 +331,51 @@ function renderGunsmith() {
       <div class="track"><div class="fill" style="width:${s.v}%;background:${fill}"></div></div>
     </div>`;
   }).join("");
+}
+
+function renderGunsmithAtts(atts) {
+  const atEl = $("gs-atts");
+  if (atEl.children.length !== ATTS.length) {
+    atEl.innerHTML = "";
+    ATTS.forEach((a, ai) => {
+      const b = document.createElement("button");
+      b.className = "attbtn";
+      b.addEventListener("click", () => {
+        const cur = curAtts();
+        cur[ai] = (cur[ai] + 1) % a.opts.length;
+        saveSettings();
+        renderGunsmith({ weaponChanged: false });
+      });
+      atEl.appendChild(b);
+    });
+  }
+  ATTS.forEach((a, ai) => {
+    const oi = atts[ai];
+    const b = atEl.children[ai];
+    b.className = "attbtn" + (oi !== 0 ? " on" : "");
+    b.innerHTML = `<div class="kind">${a.kind}</div><div class="nm">${a.opts[oi][0]}</div>`;
+  });
+}
+
+function renderGunsmith({ weaponChanged = true } = {}) {
+  const wi = curWeapon(), atts = curAtts();
+  const w = WEAPONS[wi];
+  ensureGunsmithList();
+
+  for (const b of $("gs-weapons").children) {
+    b.classList.toggle("sel", Number(b.dataset.idx) === wi);
+  }
+
+  $("gs-name").textContent = w.name;
+  $("gs-sub").textContent = w.origin;
+  $("gs-real").textContent = "ANALOGUE · " + w.real;
+  $("gs-note").textContent = w.note;
+  schematicInto($("gs-stage"), wi, atts, true, {
+    animate: weaponChanged || _gsLastWeapon !== wi,
+  });
+  renderGunsmithAtts(atts);
+  renderGunsmithStats(wi, atts);
+  _gsLastWeapon = wi;
 }
 
 /* ---------------- settings screen ---------------- */

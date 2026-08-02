@@ -185,7 +185,7 @@ function muzzleDevice(R, kind, r, z, y, big = false) {
   return { end: z - 0.052 };
 }
 
-// Red dot / prism optic on a riser. Returns the sight-line height.
+// Red dot / prism / iron on a riser. Returns the optic-center {y,z} used for ADS.
 function opticUnit(R, kind, y, z) {
   if (kind === "reddot") {
     R.box("blk", 0.026, 0.026, 0.042, 0, y + 0.013, z);                  // mount
@@ -194,7 +194,7 @@ function opticUnit(R, kind, y, z) {
     R.tube("lens", 0.0145, 0.004, 0, y + 0.042, z - 0.03);
     R.box("acc", 0.0035, 0.0035, 0.002, 0, y + 0.042, z - 0.032);        // dot
     R.box("blk", 0.006, 0.012, 0.012, 0.017, y + 0.046, z + 0.006);      // turret
-    return y + 0.042;
+    return { y: y + 0.042, z: z - 0.006 };
   }
   if (kind === "prism") {
     R.box("blk", 0.028, 0.024, 0.05, 0, y + 0.012, z + 0.005);
@@ -205,13 +205,13 @@ function opticUnit(R, kind, y, z) {
     R.tube("lens", 0.02, 0.004, 0, y + 0.046, z + 0.039);
     R.cylY("blk", 0.009, 0.016, 0, y + 0.062, z - 0.006);                // elevation turret
     R.cylX("blk", 0.009, 0.016, 0.019, y + 0.046, z - 0.006);            // windage turret
-    return y + 0.046;
+    return { y: y + 0.046, z: z - 0.01 };
   }
-  // folding rear aperture
+  // folding rear aperture — sight line through the aperture hole
   R.box("blk", 0.02, 0.006, 0.016, 0, y + 0.004, z + 0.02);
   R.box("blk", 0.018, 0.026, 0.005, 0, y + 0.02, z + 0.024);
   R.box("dgy", 0.006, 0.006, 0.006, 0, y + 0.026, z + 0.024);
-  return y + 0.026;
+  return { y: y + 0.026, z: z + 0.024 };
 }
 
 // Precision / telescopic sight for the marksman and anti-materiel rifles.
@@ -225,7 +225,23 @@ function riflescope(R, y, z, len, r) {
   R.cylX("blk", r * 0.62, 0.02, r + 0.008, y, z - len * 0.06);
   R.box("dgy", r * 2.1, 0.03, 0.016, 0, y - r - 0.008, z - len * 0.22);  // rings
   R.box("dgy", r * 2.1, 0.03, 0.016, 0, y - r - 0.008, z + len * 0.2);
-  return y;
+  return { y, z };
+}
+
+// Clamp / sanitize sight meta so a bad builder can't park ADS off-axis.
+export function normalizeSight(meta) {
+  const s = meta?.sight || {};
+  let x = Number.isFinite(s.x) ? s.x : 0;
+  let y = Number.isFinite(s.y) ? s.y : 0.08;
+  let z = Number.isFinite(s.z) ? s.z : -0.02;
+  if (Math.abs(x) > 0.04) x = 0;
+  if (y < 0.02 || y > 0.28) y = 0.08;
+  if (z < -0.20 || z > 0.16) z = -0.02;
+  const adsZ = Number.isFinite(meta?.adsZ) ? meta.adsZ : -0.24;
+  return {
+    sight: { x, y, z },
+    adsZ: Math.max(-0.42, Math.min(-0.16, adsZ)),
+  };
 }
 
 function bipod(R, z, y, len = 0.13) {
@@ -303,16 +319,17 @@ function buildAR15(R, MAG, BOLT, o) {
   BOLT.box("dgy", 0.034, 0.012, 0.024, 0, boreY + 0.036, 0.108);         // charging handle
   BOLT.box("dgy", 0.012, 0.01, 0.03, 0, boreY + 0.036, 0.09);
 
-  const sightY = opticUnit(R, o.optic, boreY + 0.038, -0.02);
+  const sight = opticUnit(R, o.optic, boreY + 0.038, -0.02);
   if (o.under === "grip") vertGrip(R, hgFront + 0.075, boreY - 0.03);
   if (o.under === "bipod") bipod(R, hgFront + 0.03, boreY - 0.026);
 
   return {
-    sight: { x: 0, y: sightY, z: -0.02 },
+    sight: { x: 0, y: sight.y, z: sight.z },
+    adsZ: -0.24,
     muzzle: { x: 0, y: boreY, z: mz.end - 0.01 },
     eject: { x: 0.03, y: boreY + 0.012, z: 0.02 },
     anchors: {
-      OPTIC: [-0.02, sightY + 0.02], MUZZLE: [barEnd - 0.02, boreY],
+      OPTIC: [sight.z, sight.y + 0.02], MUZZLE: [barEnd - 0.02, boreY],
       MAGAZINE: [0.045, -0.09], STOCK: [0.27, 0.04], HANDGUARD: [hgFront + 0.09, boreY - 0.026],
     },
     vmScale: 1, length: 0.36 - barEnd,
@@ -367,18 +384,19 @@ function buildMP5(R, MAG, BOLT, o) {
   BOLT.box("dgy", 0.02, 0.016, 0.03, -0.026, boreY + 0.03, -0.185);      // cocking handle
   BOLT.box("dgy", 0.016, 0.014, 0.014, -0.034, boreY + 0.03, -0.20);
 
-  const sightY = o.optic === "iron"
-    ? boreY + 0.03
+  const sight = o.optic === "iron"
+    ? { y: boreY + 0.03, z: 0.085 }
     : opticUnit(R, o.optic, boreY + 0.03, -0.01);
   if (o.under === "grip") vertGrip(R, -0.19, boreY - 0.032);
   if (o.under === "bipod") bipod(R, -0.20, boreY - 0.03, 0.10);
 
   return {
-    sight: { x: 0, y: sightY, z: -0.01 },
+    sight: { x: 0, y: sight.y, z: sight.z },
+    adsZ: -0.22,
     muzzle: { x: 0, y: boreY, z: mz.end - 0.01 },
     eject: { x: 0.028, y: boreY + 0.012, z: -0.02 },
     anchors: {
-      OPTIC: [-0.01, sightY + 0.02], MUZZLE: [barEnd - 0.02, boreY],
+      OPTIC: [sight.z, sight.y + 0.02], MUZZLE: [barEnd - 0.02, boreY],
       MAGAZINE: [0.045, -0.09], STOCK: [0.24, 0.03], HANDGUARD: [-0.165, boreY - 0.03],
     },
     vmScale: 1.04, length: 0.32 - barEnd,
@@ -453,16 +471,19 @@ function buildAK(R, MAG, BOLT, o) {
   BOLT.box("dgy", 0.014, 0.016, 0.05, 0.028, boreY + 0.024, -0.03);      // right-side handle
   BOLT.box("dgy", 0.02, 0.014, 0.016, 0.036, boreY + 0.024, -0.05);
 
-  const sightY = o.optic === "iron" ? boreY + 0.046 : opticUnit(R, o.optic, 0.086, -0.03);
+  const sight = o.optic === "iron"
+    ? { y: 0.096, z: -0.072 }
+    : opticUnit(R, o.optic, 0.086, -0.03);
   if (o.under === "grip") vertGrip(R, -0.185, boreY - 0.042);
   if (o.under === "bipod") bipod(R, -0.20, boreY - 0.04);
 
   return {
-    sight: { x: 0, y: sightY, z: -0.03 },
+    sight: { x: 0, y: sight.y, z: sight.z },
+    adsZ: -0.25,
     muzzle: { x: 0, y: boreY, z: mz.end - 0.01 },
     eject: { x: 0.03, y: boreY + 0.026, z: 0.0 },
     anchors: {
-      OPTIC: [-0.03, sightY + 0.02], MUZZLE: [barEnd - 0.03, boreY],
+      OPTIC: [sight.z, sight.y + 0.02], MUZZLE: [barEnd - 0.03, boreY],
       MAGAZINE: [0.03, -0.10], STOCK: [0.26, 0.035], HANDGUARD: [-0.15, boreY - 0.03],
     },
     vmScale: 0.98, length: 0.37 - barEnd,
@@ -512,16 +533,19 @@ function buildAR10(R, MAG, BOLT, o) {
   BOLT.box("dgy", 0.036, 0.013, 0.026, 0, boreY + 0.04, 0.116);
   BOLT.box("dgy", 0.013, 0.011, 0.032, 0, boreY + 0.04, 0.096);
 
-  const sightY = riflescope(R, boreY + 0.086, -0.03, o.optic === "reddot" ? 0.19 : 0.26, 0.019);
+  const sight = o.optic === "iron"
+    ? opticUnit(R, "iron", boreY + 0.043, -0.02)
+    : riflescope(R, boreY + 0.086, -0.03, o.optic === "reddot" ? 0.19 : 0.26, 0.019);
   if (o.under === "grip") vertGrip(R, hgFront + 0.08, boreY - 0.034);
   if (o.under === "bipod" || o.under === "none") bipod(R, hgFront + 0.045, boreY - 0.03, 0.15);
 
   return {
-    sight: { x: 0, y: sightY, z: -0.03 },
+    sight: { x: 0, y: sight.y, z: sight.z },
+    adsZ: -0.28,
     muzzle: { x: 0, y: boreY, z: mz.end - 0.01 },
     eject: { x: 0.032, y: boreY + 0.014, z: 0.02 },
     anchors: {
-      OPTIC: [-0.03, sightY + 0.026], MUZZLE: [barEnd - 0.03, boreY],
+      OPTIC: [sight.z, sight.y + 0.026], MUZZLE: [barEnd - 0.03, boreY],
       MAGAZINE: [0.05, -0.10], STOCK: [0.29, 0.04], BIPOD: [hgFront + 0.045, boreY - 0.12],
     },
     vmScale: 0.92, length: 0.40 - barEnd,
@@ -580,22 +604,120 @@ function buildM82(R, MAG, BOLT, o) {
   BOLT.box("dgy", 0.018, 0.02, 0.06, 0.038, boreY + 0.03, 0.0);
   BOLT.box("dgy", 0.024, 0.018, 0.02, 0.048, boreY + 0.03, -0.024);
 
-  const sightY = riflescope(R, boreY + 0.155, -0.05, o.optic === "reddot" ? 0.22 : 0.30, 0.023);
+  const sight = riflescope(R, boreY + 0.155, -0.05, o.optic === "reddot" ? 0.22 : 0.30, 0.023);
   bipod(R, -0.30, boreY - 0.05, 0.19);
 
   return {
-    sight: { x: 0, y: sightY, z: -0.05 },
+    sight: { x: 0, y: sight.y, z: sight.z },
+    adsZ: -0.34,
     muzzle: { x: 0, y: boreY, z: mz.end - 0.01 },
     eject: { x: 0.04, y: boreY + 0.02, z: 0.02 },
     anchors: {
-      OPTIC: [-0.05, sightY + 0.03], "MUZZLE BRAKE": [barEnd - 0.05, boreY],
+      OPTIC: [sight.z, sight.y + 0.03], "MUZZLE BRAKE": [barEnd - 0.05, boreY],
       MAGAZINE: [0.062, -0.12], STOCK: [0.32, 0.03], BIPOD: [-0.30, boreY - 0.20],
     },
     vmScale: 0.78, length: 0.44 - barEnd,
   };
 }
 
-const BUILDERS = { ar15: buildAR15, mp5: buildMP5, ak: buildAK, ar10: buildAR10, m82: buildM82 };
+// Gatling-pattern rotary LMG. BOLT holds the spinning barrel cluster.
+function buildMinigun(R, MAG, BOLT, o) {
+  const boreY = 0.055;
+  const barEnd = o.barrel === "long" ? -0.58 : o.barrel === "short" ? -0.40 : -0.50;
+  const barLen = Math.abs(barEnd + 0.08);
+
+  // receiver / motor housing
+  R.box("dgy", 0.078, 0.095, 0.28, 0, boreY + 0.01, 0.06);
+  R.box("blk", 0.082, 0.04, 0.18, 0, boreY + 0.055, 0.04);               // top deck
+  R.rail("dgy", 0.022, 0.14, 0, boreY + 0.078, -0.02, 6);
+  R.tube("dgy", 0.042, 0.10, 0, boreY, -0.12);                           // motor collar
+  R.box("blk", 0.06, 0.05, 0.08, 0, boreY - 0.01, -0.08);                // gearbox
+
+  // spade grips + dual triggers
+  R.box("blk", 0.07, 0.055, 0.04, 0, boreY + 0.02, 0.22);
+  for (const s of [-1, 1]) {
+    R.box("blk", 0.018, 0.09, 0.04, s * 0.04, boreY - 0.02, 0.24, -0.15);
+    R.box("dgy", 0.02, 0.03, 0.03, s * 0.04, boreY - 0.06, 0.255);
+  }
+  R.box("stl", 0.01, 0.03, 0.012, 0, boreY - 0.01, 0.20);                // trigger bar
+
+  // aircraft stock / shoulder brace
+  if (o.stock === "skel") {
+    R.tube("dgy", 0.01, 0.16, 0.02, boreY + 0.01, 0.30);
+    R.tube("dgy", 0.01, 0.16, -0.02, boreY + 0.01, 0.30);
+    R.box("blk", 0.06, 0.07, 0.016, 0, boreY, 0.38);
+  } else if (o.stock === "heavy") {
+    R.box("blk", 0.06, 0.09, 0.18, 0, boreY - 0.01, 0.32, 0.04);
+    R.box("dgy", 0.062, 0.10, 0.018, 0, boreY - 0.015, 0.41);
+  } else {
+    R.box("blk", 0.055, 0.07, 0.14, 0, boreY, 0.30, 0.03);
+    R.box("dgy", 0.058, 0.085, 0.016, 0, boreY - 0.005, 0.375);
+  }
+
+  // barrel shroud / flash cone (static)
+  R.tube("dgy", 0.055, 0.08, 0, boreY, barEnd + 0.04, 0, 14, 0.04);
+  R.tube("blk", 0.048, 0.03, 0, boreY, barEnd + 0.08);
+  const mz = o.muzzle === "sup"
+    ? muzzleDevice(R, "sup", 0.014, barEnd, boreY, true)
+    : o.muzzle === "comp"
+      ? muzzleDevice(R, "comp", 0.014, barEnd, boreY)
+      : { end: barEnd };
+
+  // Barrel cluster in BOLT local space (origin = bore axis). buildWeaponModel
+  // lifts boltGroup to boreY so rotation.z spins the cluster correctly.
+  const barrelR = 0.022;
+  for (let i = 0; i < 6; i++) {
+    const a = (i / 6) * Math.PI * 2;
+    const bx = Math.cos(a) * barrelR;
+    const by = Math.sin(a) * barrelR;
+    BOLT.tube("stl", 0.0075, barLen, bx, by, (barEnd - 0.08) / 2, 0, 8);
+  }
+  BOLT.tube("dgy", 0.018, 0.04, 0, 0, -0.10);                             // hub
+  BOLT.tube("blk", 0.038, 0.02, 0, 0, barEnd + 0.10);                      // muzzle plate
+  for (let i = 0; i < 6; i++) {
+    const a = (i / 6) * Math.PI * 2;
+    BOLT.tube("dgy", 0.009, 0.016, Math.cos(a) * barrelR, Math.sin(a) * barrelR, barEnd + 0.02);
+  }
+
+  // side box mag
+  const magH = o.mag === "ext" ? 0.22 : 0.17;
+  MAG.box("dgy", 0.08, magH, 0.12, 0.06, -magH / 2 - 0.01, 0.04);
+  MAG.box("blk", 0.082, 0.014, 0.122, 0.06, -0.008, 0.04);
+  MAG.box("blk", 0.082, 0.012, 0.122, 0.06, -magH - 0.014, 0.04);
+  if (o.mag === "fast") MAG.box("acc", 0.084, 0.008, 0.06, 0.06, -magH - 0.02, 0.04);
+  R.box("dgy", 0.04, 0.04, 0.05, 0.045, boreY - 0.02, 0.02);             // feed chute
+
+  if (o.under === "grip") vertGrip(R, -0.05, boreY - 0.05);
+  if (o.under === "bipod") bipod(R, -0.16, boreY - 0.04, 0.14);
+
+  const sight = o.optic === "iron"
+    ? (() => {
+      R.box("blk", 0.02, 0.028, 0.008, 0, boreY + 0.09, 0.08);
+      R.box("dgy", 0.006, 0.008, 0.006, 0, boreY + 0.104, 0.08);
+      R.box("blk", 0.012, 0.02, 0.012, 0, boreY + 0.085, barEnd + 0.12);
+      return { y: boreY + 0.104, z: 0.08 };
+    })()
+    : opticUnit(R, o.optic, boreY + 0.078, -0.02);
+
+  return {
+    sight: { x: 0, y: sight.y, z: sight.z },
+    adsZ: -0.30,
+    spinBarrels: true,
+    boreY,
+    muzzle: { x: 0, y: boreY, z: mz.end - 0.01 },
+    eject: { x: 0.05, y: boreY + 0.02, z: 0.0 },
+    anchors: {
+      OPTIC: [sight.z, sight.y + 0.02], MUZZLE: [barEnd - 0.02, boreY],
+      MAGAZINE: [0.06, -0.12], STOCK: [0.34, boreY], MOTOR: [-0.12, boreY],
+    },
+    vmScale: 0.82, length: 0.42 - barEnd,
+  };
+}
+
+const BUILDERS = {
+  ar15: buildAR15, mp5: buildMP5, ak: buildAK,
+  ar10: buildAR10, m82: buildM82, minigun: buildMinigun,
+};
 
 // Attachment indices -> the option keys the builders branch on.
 export function attKeys(ATTS, atts) {
@@ -608,24 +730,31 @@ export function attKeys(ATTS, atts) {
    handle (racks at the end of one). */
 export function buildWeaponModel(THREE, modelKey, opts) {
   const { R, MAG, BOLT, meta } = runBuilder(modelKey, opts);
+  const norm = normalizeSight(meta);
 
   const group = new THREE.Group();
   group.add(R.build(THREE));
   const magGroup = MAG.build(THREE);
   const boltGroup = BOLT.build(THREE);
+  if (meta.spinBarrels) boltGroup.position.y = meta.boreY ?? 0;
   group.add(magGroup, boltGroup);
 
   return {
     group, magGroup, boltGroup,
     parts: [...R.parts, ...MAG.parts, ...BOLT.parts],
     ...meta,
+    sight: norm.sight,
+    adsZ: norm.adsZ,
   };
 }
 
 function runBuilder(modelKey, opts) {
   const R = new Rig(), MAG = new Rig(), BOLT = new Rig();
-  const fn = BUILDERS[modelKey] || buildAR15;
-  const meta = fn(R, MAG, BOLT, opts);
+  const fn = BUILDERS[modelKey];
+  if (!fn) {
+    if (typeof console !== "undefined") console.warn(`[weapons3d] unknown model "${modelKey}", using ar15`);
+  }
+  const meta = (fn || buildAR15)(R, MAG, BOLT, opts);
   return { R, MAG, BOLT, meta };
 }
 
@@ -633,7 +762,11 @@ function runBuilder(modelKey, opts) {
 // draw a true side view, with no WebGL objects allocated.
 export function describeWeapon(modelKey, opts) {
   const { R, MAG, BOLT, meta } = runBuilder(modelKey, opts);
-  return { parts: [...R.parts, ...MAG.parts, ...BOLT.parts], ...meta };
+  const norm = normalizeSight(meta);
+  const boltParts = meta.spinBarrels
+    ? BOLT.parts.map(p => ({ ...p, v: p.v + (meta.boreY || 0) }))
+    : BOLT.parts;
+  return { parts: [...R.parts, ...MAG.parts, ...boltParts], ...meta, sight: norm.sight, adsZ: norm.adsZ };
 }
 
 /* ---------------- schematic ----------------

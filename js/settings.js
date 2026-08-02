@@ -8,6 +8,16 @@
 
 const KEY = "echelon.settings.v2";
 
+// Default attachment row per armory slot. Length must match WEAPONS in data.js.
+const DEFAULT_ATTS = [
+  [1, 1, 0, 1, 0, 1],   // KM-7  red dot · compensator · std · vert grip · std · skeleton
+  [1, 0, 2, 1, 0, 1],   // VZ-9  red dot · std · CQB · vert grip · std · skeleton
+  [1, 1, 0, 0, 0, 0],   // PK-74 red dot · comp · std · none · std · std
+  [2, 2, 1, 2, 0, 2],   // LR-13 prism · suppressed · long · bipod · std · heavy
+  [2, 0, 1, 2, 0, 2],   // AM-50 prism · brake · long · bipod · std · heavy
+  [1, 1, 0, 1, 1, 0],   // GX-60 reddot · comp · std · grip · extended · std
+];
+
 export const DEFAULTS = {
   hudScale: 1,
   hudAlpha: 0.92,
@@ -36,15 +46,25 @@ export const DEFAULTS = {
   // build you set up for each one.
   loadout: {
     weapon: 0,
-    atts: [
-      [1, 1, 0, 1, 0, 1],   // KM-7  red dot · compensator · std · vert grip · std · skeleton
-      [1, 0, 2, 1, 0, 1],   // VZ-9  red dot · std · CQB · vert grip · std · skeleton
-      [1, 1, 0, 0, 0, 0],   // PK-74 red dot · comp · std · none · std · std
-      [2, 2, 1, 2, 0, 2],   // LR-13 prism · suppressed · long · bipod · std · heavy
-      [2, 0, 1, 2, 0, 2],   // AM-50 prism · brake · long · bipod · std · heavy
-    ],
+    atts: DEFAULT_ATTS.map(a => a.slice()),
   },
 };
+
+/** Pad / repair loadout.atts when new weapons ship after a save was written. */
+export function migrateLoadout(s = settings) {
+  if (!s.loadout) s.loadout = deepMerge(DEFAULTS.loadout, {});
+  if (!Array.isArray(s.loadout.atts)) s.loadout.atts = [];
+  const atts = s.loadout.atts;
+  for (let i = 0; i < DEFAULT_ATTS.length; i++) {
+    if (!Array.isArray(atts[i]) || atts[i].length < 6) {
+      atts[i] = DEFAULT_ATTS[i].slice();
+    }
+  }
+  if (!Number.isInteger(s.loadout.weapon) || s.loadout.weapon < 0 || s.loadout.weapon >= DEFAULT_ATTS.length) {
+    s.loadout.weapon = 0;
+  }
+  return s;
+}
 
 /* Controls the layout editor knows about. `label` shows in the editor,
    `min`/`max` bound the per-element scale. */
@@ -80,10 +100,10 @@ function deepMerge(base, over) {
 function load() {
   try {
     const raw = localStorage.getItem(KEY);
-    if (!raw) return deepMerge(DEFAULTS, {});
-    return deepMerge(DEFAULTS, JSON.parse(raw));
+    if (!raw) return migrateLoadout(deepMerge(DEFAULTS, {}));
+    return migrateLoadout(deepMerge(DEFAULTS, JSON.parse(raw)));
   } catch {
-    return deepMerge(DEFAULTS, {});
+    return migrateLoadout(deepMerge(DEFAULTS, {}));
   }
 }
 

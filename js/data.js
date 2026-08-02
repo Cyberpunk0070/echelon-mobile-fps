@@ -1,10 +1,10 @@
 // ECHELON — shared data: armory, attachments, ballistics translation.
 //
-// The five weapons are rough depictions of real service firearms — an
-// M4-pattern carbine, an MP5-pattern SMG, an AKM-pattern rifle, an AR-10
-// marksman rifle and an M82-pattern anti-materiel rifle. `model` drives both
-// the 3D viewmodel (weapons3d.js) and the gunsmith schematic, so the silhouette
-// in the menu is the silhouette you carry.
+// The armory is rough depictions of real service firearms — an M4-pattern
+// carbine, an MP5-pattern SMG, an AKM-pattern rifle, an AR-10 marksman rifle,
+// an M82-pattern anti-materiel rifle, and a six-barrel rotary LMG. `model`
+// drives both the 3D viewmodel (weapons3d.js) and the gunsmith schematic, so
+// the silhouette in the menu is the silhouette you carry.
 
 export const LOG = [
   ["0x1A", "MOUNT /pak/core.vpk", "18ms"],
@@ -12,7 +12,7 @@ export const LOG = [
   ["0x3C", "BALLISTICS TABLE · 74 ENTRIES", "31ms"],
   ["0x44", "STANCE IK · CROUCH/PRONE/SLIDE", "96ms"],
   ["0x51", "STREAM ASSETS", "612ms"],
-  ["0x70", "RECOIL PATTERNS · 5 WEAPONS", "12ms"],
+  ["0x70", "RECOIL PATTERNS · 6 WEAPONS", "12ms"],
   ["0x88", "VIEWMODEL BAKE COMPLETE", "77ms"],
 ];
 
@@ -70,6 +70,11 @@ const PAT_AK = [
 ];
 const PAT_DMR = [[0.0, 1.0], [0.14, 0.94], [-0.16, 0.92], [0.2, 0.9]];
 const PAT_AMR = [[0.0, 1.0], [0.1, 1.0]];
+const PAT_MINI = [
+  [0.0, 0.70], [0.18, 0.66], [-0.22, 0.62], [0.34, 0.58], [-0.40, 0.54], [0.48, 0.50],
+  [-0.52, 0.48], [0.56, 0.46], [-0.50, 0.44], [0.42, 0.42], [-0.36, 0.40], [0.48, 0.40],
+  [-0.54, 0.38], [0.50, 0.38], [-0.30, 0.36], [0.38, 0.36],
+];
 
 // base: [DAMAGE, RANGE, HANDLING, RECOIL CTRL, MOBILITY, FIRE RATE]
 export const WEAPONS = [
@@ -115,7 +120,19 @@ export const WEAPONS = [
     recoil: { v: 3.4, h: 0.5, recover: 5, pattern: PAT_AMR, kickback: 0.19 },
     model: "m82",
   },
+  {
+    name: "GX-60 HELLSPIN", cls: "ROTARY LMG", origin: "7.62×51 · 1400 RPM",
+    real: "Electrically driven six-barrel gatling",
+    note: "Spools before it speaks. Once the barrels are up, it owns a lane — until the box runs dry or you forget to lead the walk.",
+    base: [38, 55, 28, 34, 24, 96], rpm: 1400, mag: 120, reserve: 360, reload: 4.2, auto: true,
+    zoom: 1.3, spinUp: 0.45, dmgScale: 0.38,
+    recoil: { v: 0.48, h: 0.62, recover: 11, pattern: PAT_MINI, kickback: 0.035 },
+    model: "minigun",
+  },
 ];
+
+/** O(1) model-key → weapon def for builders / tooling. */
+export const WEAPON_BY_MODEL = new Map(WEAPONS.map(w => [w.model, w]));
 
 /* Attachment tables. Option index 0 is always the stock configuration, and
    every option carries a `part` key the model builder reads, so fitting a
@@ -213,10 +230,11 @@ export function buildLoadout(weaponIdx, atts) {
     // --- ADS ---
     adsZoom: w.zoom ?? (atts[0] === 2 ? 2.2 : 1.45),
     scope,
-    adsTime: scope ? 0.38 : 0.14 + (100 - hnd) * 0.0018,
-    adsSpreadMult: scope ? 0.02 : 0.16,
-    hipSpreadMult: scope ? 4.5 : 1,
-    adsMoveMult: scope ? 0.38 : 0.58,
+    adsTime: scope ? 0.38 : (w.spinUp ? 0.22 : 0.14) + (100 - hnd) * 0.0018,
+    adsSpreadMult: scope ? 0.02 : (w.spinUp ? 0.28 : 0.16),
+    hipSpreadMult: scope ? 4.5 : (w.spinUp ? 1.35 : 1),
+    adsMoveMult: scope ? 0.38 : (w.spinUp ? 0.45 : 0.58),
+    spinUp: w.spinUp ?? 0,
   };
 }
 

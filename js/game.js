@@ -3,7 +3,7 @@ import * as THREE from "three";
 import { Bot } from "./bots.js";
 import { SQUAD_ALLY, SQUAD_ENEMY, MATCH, ATTS } from "./data.js";
 import { settings } from "./settings.js";
-import { buildWeaponModel, attKeys } from "./weapons3d.js";
+import { buildWeaponModel, attKeys, normalizeSight } from "./weapons3d.js";
 
 const DARK = { bg: 0x151312, surface: 0x211f1e, text: 0xf3f2f2, red: 0xff563c };
 const ARENA = 47;              // half-extent of playable area
@@ -340,7 +340,9 @@ export class Game {
     this.last = performance.now();
     this.fpsFrames = 0; this.fpsT = 0;
     this.pushTimer = 20;
-    window.__game = this;
+    if (typeof location !== "undefined" && /[?&]debug=1\b/.test(location.search)) {
+      window.__game = this;
+    }
     const loop = (now) => {
       if (this.disposed) return;
       this.raf = requestAnimationFrame(loop);
@@ -683,11 +685,12 @@ export class Game {
       speedVal: 0, kills: 0, deaths: 0,
       ammo: L.mag, reserve: L.reserve,
       reloading: 0, shotT: 0, lastHurt: -10,
-      respawnT: 0, vaultT: 0, vaultFrom: null, vaultTo: null,
+      respawnT: 0, vaultT: 0,
       eyeH: STANCE_EYE[STAND], sprintOutT: 0,
       stance: STAND, stanceLock: 0,
       slideT: 0, slideDir: new THREE.Vector3(), slideSpeed: 0, diving: false,
       chestY: 1.15,
+      vaultFrom: new THREE.Vector3(), vaultTo: new THREE.Vector3(),
     };
     this.assistSlow = 1;
     this.sprinting = false;
@@ -764,16 +767,20 @@ export class Game {
     this.gun = gun;
 
     const vs = VM_SCALE * (model.vmScale ?? 1);
+    const { sight, adsZ } = normalizeSight(model);
     // Hip: canted down-right, far enough out that the receiver clears the ammo
-    // readout. ADS: the sight line is placed exactly on the camera axis, which
-    // is why the reticle and the optic agree once the aim finishes.
+    // readout. ADS: the optic center sits on the camera axis so the reticle
+    // and the modelled sight agree once the aim finishes.
     this.vmHip = new THREE.Vector3(0.125, -0.108, -0.40);
     this.vmAds = new THREE.Vector3(
-      -model.sight.x * vs,
-      -model.sight.y * vs,
-      -0.24 - model.sight.z * vs
+      -sight.x * vs,
+      -sight.y * vs,
+      adsZ - sight.z * vs
     );
     this.vmScaleFactor = vs;
+    this.spinBarrels = !!model.spinBarrels;
+    this._spin = 0;
+    this._spinAng = 0;
     this.muzzleLocal = new THREE.Vector3(model.muzzle.x, model.muzzle.y, model.muzzle.z).multiplyScalar(vs);
     this.ejectLocal = new THREE.Vector3(model.eject.x, model.eject.y, model.eject.z).multiplyScalar(vs);
 
@@ -1398,7 +1405,7 @@ export class Game {
     p.respawnT = 4.4;
     p.respawnTotal = 4.4;
     p.reloading = 0;
-    p.vaultT = 0; p.vaultFrom = null; p.vaultTo = null;
+    p.vaultT = 0;
     p.slideT = 0;
     p.stance = STAND; p.stanceLock = 0;
     this.adsOn = false;
@@ -1638,8 +1645,8 @@ export class Game {
         return;
       }
       p.vaultT = 0.36;
-      p.vaultFrom = p.pos.clone();
-      p.vaultTo = to;
+      p.vaultFrom.copy(p.pos);
+      p.vaultTo.copy(to);
       this.moveLabel = "MANTLE";
     } else if (p.grounded) {
       p.vy = 5.6;
@@ -1706,10 +1713,14 @@ export class Game {
     if (!L.auto && this._semiHeld) return;
     this._semiHeld = true;
 
+    // Rotary guns must spool before rounds leave the barrel.
+    if (L.spinUp > 0 && this._spin < 0.98) return;
+
     p.shotT = 60 / L.rpm;
     p.ammo--;
     this.sinceShot = 0;
-    this.sfx.fire(Math.min(1, L.damage / 70), L.suppressed);
+    const fireW = Math.min(1, L.damage / 70) * (L.spinUp > 0 ? 0.55 : 1);
+    this.sfx.fire(fireW, L.suppressed);
 
     const aim = this.ads;
     const stance = p.stance;
@@ -1840,6 +1851,17 @@ export class Game {
       }
 
       p.shotT -= dt;
+
+      // Minigun spool: climb while holding fire, coast down when released.
+      if (L.spinUp > 0) {
+        const want = (this.firing && p.alive && p.reloading <= 0 && !this.sprinting) ? 1 : 0;
+        const rate = want ? (1 / L.spinUp) : (1 / Math.max(0.18, L.spinUp * 0.55));
+        this._spin = Math.max(0, Math.min(1, this._spin + (want ? rate : -rate) * dt));
+        this._spinAng += dt * (8 + this._spin * 42);
+      } else {
+        this._spin = 0;
+      }
+
       if (this.firing) this.tryFire();
       else this._semiHeld = false;
 
@@ -1871,7 +1893,8 @@ export class Game {
           .slice(0, 2 + Math.round(this.botCtx.escalation * 2));
         for (const b of squad) {
           b.pushT = 6;
-          b.goal = this.player.pos.clone();
+          if (!b.goal) b.goal = new THREE.Vector3();
+          b.goal.copy(this.player.pos);
           b.repathT = 6;
         }
       }
@@ -2049,7 +2072,13 @@ export class Game {
     mag.position.copy(this.magBase);
     mag.rotation.set(0, 0, 0);
     mag.visible = true;
-    bolt.position.set(0, 0, 0);
+    if (this.spinBarrels) {
+      bolt.position.set(0, this.wm.boreY ?? 0, 0);
+      bolt.rotation.set(0, 0, this._spinAng);
+    } else {
+      bolt.position.set(0, 0, 0);
+      bolt.rotation.set(0, 0, 0);
+    }
 
     // hip <-> ADS position
     const t = this.ads;
@@ -2057,6 +2086,11 @@ export class Game {
 
     if (p.alive && p.reloading > 0) {
       this.animateReload(1 - p.reloading / L.reloadTime, vm, mag, bolt);
+      // rotary barrel cluster must stay on the bore axis after reload anim
+      if (this.spinBarrels) {
+        bolt.position.set(0, this.wm.boreY ?? 0, 0);
+        bolt.rotation.set(0, 0, this._spinAng);
+      }
     } else {
       this._rlPhase = -1;
     }

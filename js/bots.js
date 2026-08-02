@@ -37,6 +37,9 @@ const rand = (lo, hi) => lo + Math.random() * (hi - lo);
 
 const _v = new THREE.Vector3();
 const _dir = new THREE.Vector3();
+const _fwd = new THREE.Vector3();
+const _side = new THREE.Vector3();
+const _desired = new THREE.Vector3();
 
 let botSeq = 0;
 
@@ -153,20 +156,20 @@ export class Bot {
     if (visible) {
       const dist = this.pos.distanceTo(t.pos);
       _dir.subVectors(t.pos, this.pos); _dir.y = 0;
-      const fwd = _dir.clone().normalize();
+      _fwd.copy(_dir).normalize();
       this.strafeT -= dt;
       if (this.strafeT <= 0) {
         this.strafeT = rand(0.45, 1.15) / a.strafe;
         this.strafeDir = Math.random() < 0.5 ? -1 : 1;
       }
-      const side = new THREE.Vector3(-fwd.z, 0, fwd.x).multiplyScalar(this.strafeDir);
+      _side.set(-_fwd.z, 0, _fwd.x).multiplyScalar(this.strafeDir);
       // hold the archetype's preferred engagement band
       if (dist > a.idealMax) {
-        desired = fwd.clone().multiplyScalar(0.9).add(side.multiplyScalar(0.35 * a.strafe)).normalize();
+        desired = _desired.copy(_fwd).multiplyScalar(0.9).addScaledVector(_side, 0.35 * a.strafe).normalize();
       } else if (dist < a.idealMin) {
-        desired = fwd.clone().multiplyScalar(-0.6).add(side.multiplyScalar(0.85)).normalize();
+        desired = _desired.copy(_fwd).multiplyScalar(-0.6).addScaledVector(_side, 0.85).normalize();
       } else {
-        desired = side.normalize().multiplyScalar(a.strafe > 1 ? 1 : 0.65);
+        desired = _desired.copy(_side).normalize().multiplyScalar(a.strafe > 1 ? 1 : 0.65);
         if (desired.lengthSq() < 0.01) desired = null;
       }
     } else {
@@ -174,14 +177,15 @@ export class Bot {
       this.repathT -= dt;
       if (!this.goal || this.repathT <= 0 || this.pos.distanceTo(this.goal) < 2.2) {
         this.repathT = 2.5 + Math.random() * 2.0;
+        if (!this.goal) this.goal = new THREE.Vector3();
         if (t && t.alive && Math.random() < 0.75) {
-          this.goal = t.pos.clone();
+          this.goal.copy(t.pos);
         } else {
-          this.goal = ctx.world.randomNavPoint();
+          this.goal.copy(ctx.world.randomNavPoint());
         }
       }
       _dir.subVectors(this.goal, this.pos); _dir.y = 0;
-      if (_dir.lengthSq() > 0.01) desired = _dir.normalize().clone();
+      if (_dir.lengthSq() > 0.01) desired = _desired.copy(_dir).normalize();
     }
 
     // --- detour steering when stuck ---
