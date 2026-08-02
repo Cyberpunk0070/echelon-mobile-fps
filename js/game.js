@@ -3,7 +3,7 @@ import * as THREE from "three";
 import { Bot } from "./bots.js";
 import { SQUAD_ALLY, SQUAD_ENEMY, MATCH, ATTS } from "./data.js";
 import { settings } from "./settings.js";
-import { buildWeaponModel, attKeys, normalizeSight } from "./weapons3d.js";
+import { buildWeaponModel, attKeys } from "./weapons3d.js";
 
 const DARK = { bg: 0x151312, surface: 0x211f1e, text: 0xf3f2f2, red: 0xff563c };
 const ARENA = 47;              // half-extent of playable area
@@ -25,8 +25,14 @@ const STANCE_LOCK = [[0, 0.22, 0.55], [0.22, 0, 0.42], [0.60, 0.45, 0]];
 
 const SPRINT_MULT = 1.5;
 const SPRINT_OUT = 0.16;   // seconds from dropping sprint to first shot
-const SLIDE_TIME = 0.62;
-const VM_SCALE = 0.52;     // global viewmodel scale (guns are built at life size)
+// Slide: smooth glide, then friction brakes you to a stop over a fixed distance.
+const SLIDE_GLIDE_DIST = 2.7;     // metres at near-full speed
+const SLIDE_BRAKE_DIST = 2.5;     // metres of hard friction after the glide
+const SLIDE_FRIC_GLIDE = 1.6;     // m/s² during the smooth phase
+const SLIDE_FRIC_BRAKE = 22;      // m/s² once friction bites
+const SLIDE_END_SPEED = 0.35;     // drop below this → crouch settle
+const SLIDE_MAX_TIME = 1.6;       // safety cap
+const VM_SCALE = 1.0;      // schematic blocks are already viewmodel-sized (original mk() units)
 
 const _a = new THREE.Vector3(), _b = new THREE.Vector3(), _c = new THREE.Vector3();
 const _m4 = new THREE.Matrix4();
@@ -688,7 +694,8 @@ export class Game {
       respawnT: 0, vaultT: 0,
       eyeH: STANCE_EYE[STAND], sprintOutT: 0,
       stance: STAND, stanceLock: 0,
-      slideT: 0, slideDir: new THREE.Vector3(), slideSpeed: 0, diving: false,
+      slideT: 0, slideDir: new THREE.Vector3(), slideSpeed: 0, slideVel: 0,
+      slideDist: 0, diving: false,
       chestY: 1.15,
       vaultFrom: new THREE.Vector3(), vaultTo: new THREE.Vector3(),
     };
@@ -767,16 +774,17 @@ export class Game {
     this.gun = gun;
 
     const vs = VM_SCALE * (model.vmScale ?? 1);
-    const { sight, adsZ } = normalizeSight(model);
-    // Hip: canted down-right, far enough out that the receiver clears the ammo
-    // readout. ADS: the optic center sits on the camera axis so the reticle
-    // and the modelled sight agree once the aim finishes.
-    this.vmHip = new THREE.Vector3(0.125, -0.108, -0.40);
+    // Classic ADS (958776f): hip is lower-right; ADS applies a fixed offset
+    // toward center + a FOV zoom so the *whole view* tightens. Scoped rifles
+    // still hide the mesh and show the scope overlay at full aim.
+    this.vmHip = new THREE.Vector3(0.26, -0.24, -0.52);
     this.vmAds = new THREE.Vector3(
-      -sight.x * vs,
-      -sight.y * vs,
-      adsZ - sight.z * vs
+      this.vmHip.x - 0.26,   // → ~0 (centered)
+      this.vmHip.y + 0.055,
+      this.vmHip.z + 0.10
     );
+    this.vmHipRot = new THREE.Euler(0.03, 0.10, -0.05, "XYZ");
+    this.vmAdsRot = new THREE.Euler(0, 0, 0, "XYZ");
     this.vmScaleFactor = vs;
     this.spinBarrels = !!model.spinBarrels;
     this._spin = 0;
@@ -1175,7 +1183,7 @@ export class Game {
       if (e.pointerType === "mouse") {
         if (!this.pointerLocked) { this.canvas.requestPointerLock?.(); return; }
         if (e.button === 0) this.firing = true;
-        if (e.button === 2) this.adsOn = true;
+        if (e.button === 2) this.toggleAds();
         return;
       }
       const stickSide = settings.southpaw
@@ -1213,7 +1221,7 @@ export class Game {
 
     const release = e => {
       if (e.pointerType === "mouse") {
-        if (e.button === 2) this.adsOn = false;
+        // ADS is toggle (button + RMB); only FIRE releases on pointerup
         this.firing = false;
         return;
       }
@@ -1406,7 +1414,7 @@ export class Game {
     p.respawnTotal = 4.4;
     p.reloading = 0;
     p.vaultT = 0;
-    p.slideT = 0;
+    p.slideT = 0; p.slideVel = 0; p.slideDist = 0;
     p.stance = STAND; p.stanceLock = 0;
     this.adsOn = false;
     this.firing = false;
@@ -1519,15 +1527,20 @@ export class Game {
   }
 
   /* Stance input from one button or key. `deep` asks for prone; otherwise it
-     toggles stand/crouch. Sprinting turns both into their moving variants:
-     a slide, or a dive to prone. */
+     toggles stand/crouch. While moving, crouch starts a slide; sprint+prone
+     is still a dive. */
   stanceInput(deep) {
     const p = this.player;
     if (!p.alive || this.paused || this.over) return;
-    const moving = p.speedVal > 2.2;
-    if (this.sprinting && moving && p.grounded && p.slideT <= 0) {
-      if (deep) this.doDive();
-      else this.doSlide();
+    const stickMag = this.stick.mag ?? 0;
+    const moving = p.speedVal > 1.4 || stickMag > 0.4
+      || !!(this.keys["KeyW"] || this.keys["KeyA"] || this.keys["KeyS"] || this.keys["KeyD"]);
+    if (!deep && moving && p.grounded && p.slideT <= 0 && p.stance === STAND) {
+      this.doSlide();
+      return;
+    }
+    if (deep && this.sprinting && moving && p.grounded && p.slideT <= 0) {
+      this.doDive();
       return;
     }
     if (deep) this.setStance(p.stance === PRONE ? STAND : PRONE);
@@ -1556,14 +1569,28 @@ export class Game {
   doSlide() {
     const p = this.player;
     if (p.slideT > 0 || !p.grounded) return;
-    const fx = -Math.sin(p.yaw), fz = -Math.cos(p.yaw);
+    // Prefer the current move direction; fall back to facing.
+    let fx = -Math.sin(p.yaw), fz = -Math.cos(p.yaw);
+    const mx = (this.keys["KeyD"] ? 1 : 0) - (this.keys["KeyA"] ? 1 : 0) + this.stick.x;
+    const mz = (this.keys["KeyW"] ? 1 : 0) - (this.keys["KeyS"] ? 1 : 0) - this.stick.y;
+    if (Math.hypot(mx, mz) > 0.2) {
+      const sin = Math.sin(p.yaw), cos = Math.cos(p.yaw);
+      const wx = (-sin * mz) + (cos * mx);
+      const wz = (-cos * mz) + (-sin * mx);
+      const len = Math.hypot(wx, wz) || 1;
+      fx = wx / len; fz = wz / len;
+    }
     p.slideDir.set(fx, 0, fz);
-    p.slideT = SLIDE_TIME;
-    p.slideSpeed = this.loadout.moveSpeed * SPRINT_MULT * 1.22;
+    const base = this.loadout.moveSpeed * (this.sprinting ? SPRINT_MULT * 1.18 : 1.35);
+    p.slideSpeed = Math.max(base, p.speedVal * 1.05);
+    p.slideVel = p.slideSpeed;
+    p.slideDist = 0;
+    p.slideT = SLIDE_MAX_TIME;
     p.stance = CROUCH;
     p.height = STANCE_HEIGHT[CROUCH];
-    p.stanceLock = 0.16;
+    p.stanceLock = 0.12;
     this.sprinting = false;
+    this.adsOn = false;
     this.sfx.slide();
     this.moveLabel = "SLIDE";
   }
@@ -1707,7 +1734,7 @@ export class Game {
   tryFire() {
     const p = this.player, L = this.loadout;
     if (!p.alive || p.reloading > 0) return;
-    if (this.sprinting || p.sprintOutT > 0 || p.stanceLock > 0 || p.slideT > 0.25) return;
+    if (this.sprinting || p.sprintOutT > 0 || p.stanceLock > 0 || p.slideVel > 1.0) return;
     if (p.shotT > 0) return;
     if (p.ammo <= 0) { this.startReload(); return; }
     if (!L.auto && this._semiHeld) return;
@@ -1955,12 +1982,22 @@ export class Game {
     let wx, wz, speed;
 
     if (p.slideT > 0) {
-      // committed slide: direction is locked, speed decays into a crouch
+      // Smooth glide, then friction brakes over distance into a crouch.
       p.slideT -= dt;
-      const k = Math.max(0, p.slideT / SLIDE_TIME);
-      speed = p.slideSpeed * (0.35 + 0.65 * k);
+      const fric = p.slideDist < SLIDE_GLIDE_DIST ? SLIDE_FRIC_GLIDE : SLIDE_FRIC_BRAKE;
+      p.slideVel = Math.max(0, p.slideVel - fric * dt);
+      speed = p.slideVel;
       wx = p.slideDir.x; wz = p.slideDir.z;
-      if (p.slideT <= 0) { p.stanceLock = 0.12; this.moveLabel = "CROUCH"; }
+      const step = speed * dt;
+      p.slideDist += step;
+      if (p.slideVel <= SLIDE_END_SPEED
+        || p.slideDist >= SLIDE_GLIDE_DIST + SLIDE_BRAKE_DIST
+        || p.slideT <= 0) {
+        p.slideT = 0;
+        p.slideVel = 0;
+        p.stanceLock = 0.14;
+        this.moveLabel = "CROUCH";
+      }
     } else if (p.diving && !p.grounded) {
       speed = p.slideSpeed;
       wx = p.slideDir.x; wz = p.slideDir.z;
@@ -2049,7 +2086,8 @@ export class Game {
     cam.rotation.y = p.yaw + this.recoilYaw + shx;
     cam.rotation.x = p.pitch + this.recoilPitch + shy;
     // lean into a slide, and roll slightly with strafe
-    const slideRoll = p.slideT > 0 ? 0.16 * (p.slideT / SLIDE_TIME) : 0;
+    const slideBlend = p.slideT > 0 && p.slideSpeed > 0 ? Math.min(1, p.slideVel / p.slideSpeed) : 0;
+    const slideRoll = 0.16 * slideBlend;
     const strafeRoll = -this.stick.x * 0.016 * (1 - this.ads);
     cam.rotation.z = slideRoll + strafeRoll + bobX * 0.25;
 
@@ -2080,9 +2118,12 @@ export class Game {
       bolt.rotation.set(0, 0, 0);
     }
 
-    // hip <-> ADS position
+    // hip <-> ADS position; cant eases toward a slight ADS rest pose
     const t = this.ads;
     _a.copy(this.vmHip).lerp(this.vmAds, t);
+    vm.rotation.x += this.vmHipRot.x * (1 - t) + this.vmAdsRot.x * t;
+    vm.rotation.y += this.vmHipRot.y * (1 - t) + this.vmAdsRot.y * t;
+    vm.rotation.z += this.vmHipRot.z * (1 - t) + this.vmAdsRot.z * t;
 
     if (p.alive && p.reloading > 0) {
       this.animateReload(1 - p.reloading / L.reloadTime, vm, mag, bolt);
@@ -2112,8 +2153,8 @@ export class Game {
 
     // stance offsets: prone tucks the weapon in, a slide throws it wide
     if (p.stance === PRONE) { _a.y += 0.02 * (1 - t); _a.z += 0.02 * (1 - t); }
-    if (p.slideT > 0) {
-      const k = p.slideT / SLIDE_TIME;
+    if (p.slideT > 0 && p.slideSpeed > 0) {
+      const k = Math.min(1, p.slideVel / p.slideSpeed);
       vm.rotation.z += 0.34 * k;
       vm.rotation.x += 0.22 * k;
       _a.y -= 0.05 * k;
@@ -2214,18 +2255,18 @@ export class Game {
       if (this.promptT <= 0) this.$("hud-prompt").textContent = "";
     }
 
-    // crosshair opens with real spread — plus sustained fire — so it reads as
-    // a live bloom indicator rather than decoration
+    // Crosshair: bloom from spread, plus the classic ADS tighten (958776f).
     const bloom = Math.round(
       (L.spreadDeg * (L.hipSpreadMult + (L.adsSpreadMult - L.hipSpreadMult) * this.ads)
         * STANCE_SPREAD[p.stance] + (p.speedVal > 0.5 ? 1.4 : 0)) * 4
       + Math.min(8, this.shotIdx * 0.7)
     );
     const chHidden = (L.scope && this.ads > 0.6) || !p.alive;
-    this.hudSet("ch", `${bloom}|${chHidden ? 1 : 0}`, () => {
+    const chScale = (0.72 + bloom * 0.05) * (1 - 0.4 * this.ads);
+    this.hudSet("ch", `${bloom}|${chHidden ? 1 : 0}|${chScale.toFixed(3)}`, () => {
       const ch = this.$("crosshair");
       ch.style.opacity = chHidden ? 0 : 1;
-      ch.style.transform = `translate(-50%,-50%) scale(${(0.72 + bloom * 0.05).toFixed(3)})`;
+      ch.style.transform = `translate(-50%,-50%) scale(${chScale.toFixed(3)})`;
     });
     this.hudSet("scope", L.scope && this.ads > 0.92,
       v => { this.$("scope-overlay").style.display = v ? "block" : "none"; });

@@ -125,7 +125,7 @@ export const WEAPONS = [
     real: "Electrically driven six-barrel gatling",
     note: "Spools before it speaks. Once the barrels are up, it owns a lane — until the box runs dry or you forget to lead the walk.",
     base: [38, 55, 28, 34, 24, 96], rpm: 1400, mag: 120, reserve: 360, reload: 4.2, auto: true,
-    zoom: 1.3, spinUp: 0.45, dmgScale: 0.38,
+    zoom: 1.7, spinUp: 0.45, dmgScale: 0.38,
     recoil: { v: 0.48, h: 0.62, recover: 11, pattern: PAT_MINI, kickback: 0.035 },
     model: "minigun",
   },
@@ -228,7 +228,9 @@ export function buildLoadout(weaponIdx, atts) {
     mag, reserve: w.reserve, reloadTime: reload,
     stats: st, suppressed,
     // --- ADS ---
-    adsZoom: w.zoom ?? (atts[0] === 2 ? 2.2 : 1.45),
+    // Default zoom is strong enough that ADS clearly changes the whole view
+    // (early CoD-style pass used ~1.35; prism / marksman / AMR go higher).
+    adsZoom: w.zoom ?? (atts[0] === 2 ? 2.4 : 1.75),
     scope,
     adsTime: scope ? 0.38 : (w.spinUp ? 0.22 : 0.14) + (100 - hnd) * 0.0018,
     adsSpreadMult: scope ? 0.02 : (w.spinUp ? 0.28 : 0.16),
